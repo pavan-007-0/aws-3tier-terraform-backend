@@ -26,7 +26,6 @@ terraform {
 
   # Bucket name is supplied by the pipeline via:
   #   terraform init -backend-config="bucket=$STATE_BUCKET"
-  # The bucket is created automatically in the bootstrap stage.
   backend "s3" {
     key    = "ecommerce/backend/terraform.tfstate"
     region = "us-east-1"
