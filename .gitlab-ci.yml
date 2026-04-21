@@ -23,7 +23,6 @@ variables:
 # ==========================
 # STAGE 1 - VALIDATE
 # ==========================
-
 validate-aws-credentials:
   stage: validate
   image:
@@ -75,7 +74,7 @@ validate-terraform:
     entrypoint: [""]
   script:
     - cd "$TF_DIR"
-    - terraform fmt -check -recursive
+    - terraform fmt -check -recursive -diff
     - terraform init -backend=false
     - terraform validate
   only:
@@ -86,7 +85,6 @@ validate-terraform:
 # Auto-create the S3 bucket Terraform will use for remote state.
 # Idempotent - safe on every run.
 # ==========================
-
 bootstrap-state-bucket:
   stage: bootstrap
   image:
@@ -123,7 +121,6 @@ bootstrap-state-bucket:
 # Creates VPC, subnets, RDS SG, ECR, EKS cluster + nodegroup,
 # ALB controller, External Secrets Operator, ClusterSecretStore.
 # ==========================
-
 infra-apply:
   stage: infra
   image:
@@ -150,10 +147,9 @@ infra-apply:
 # STAGE 4 - BUILD
 # Build backend image and push to the ECR created by Terraform.
 # ==========================
-
 build-backend:
   stage: build
-  image: alpine:3.21
+  image: docker:24
   services:
     - docker:24-dind
   variables:
@@ -161,7 +157,7 @@ build-backend:
     DOCKER_TLS_CERTDIR: ""
   needs: ["infra-apply", "validate-python-code", "validate-dockerfile"]
   before_script:
-    - apk add --no-cache aws-cli docker-cli
+    - apk add --no-cache aws-cli
     - *aws_env
   script:
     - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
@@ -175,7 +171,6 @@ build-backend:
 # STAGE 5 - DEPLOY
 # Re-apply Terraform with -replace to roll out the new image.
 # ==========================
-
 deploy-backend:
   stage: deploy
   image:
