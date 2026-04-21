@@ -16,9 +16,21 @@ variables:
 # Helper: every job that touches AWS or Terraform exports
 # AWS_ACCOUNT_ID and STATE_BUCKET so init/apply work the same way.
 .aws_env: &aws_env
-  - export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+  - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+  - 'if [ -z "$AWS_ACCOUNT_ID" ]; then echo "ERROR: failed to get AWS account ID"; exit 1; fi'
+  - export AWS_ACCOUNT_ID
   - export STATE_BUCKET="tf-state-${AWS_ACCOUNT_ID}-${AWS_DEFAULT_REGION}"
   - echo "AWS account $AWS_ACCOUNT_ID  /  state bucket $STATE_BUCKET"
+
+# Helper: install AWS CLI v2 from the official zip on Alpine-based images
+# (do NOT use `apk add aws-cli` — Alpine's package is broken on the
+# hashicorp/terraform image due to a libexpat/Python ABI mismatch).
+.install_awscli: &install_awscli
+  - apk add --no-cache curl unzip
+  - curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/aws.zip
+  - unzip -q /tmp/aws.zip -d /tmp
+  - /tmp/aws/install -i /usr/local/aws-cli -b /usr/local/bin
+  - aws --version
 
 # ==========================
 # STAGE 1 - VALIDATE
@@ -128,7 +140,7 @@ infra-apply:
     entrypoint: [""]
   needs: ["bootstrap-state-bucket"]
   before_script:
-    - apk add --no-cache aws-cli || (wget -qO- https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip > /tmp/aws.zip && unzip /tmp/aws.zip -d /tmp && /tmp/aws/install)
+    - *install_awscli
     - *aws_env
   script:
     - cd "$TF_DIR"
@@ -157,7 +169,7 @@ build-backend:
     DOCKER_TLS_CERTDIR: ""
   needs: ["infra-apply", "validate-python-code", "validate-dockerfile"]
   before_script:
-    - apk add --no-cache aws-cli
+    - *install_awscli
     - *aws_env
   script:
     - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
@@ -178,7 +190,7 @@ deploy-backend:
     entrypoint: [""]
   needs: ["build-backend"]
   before_script:
-    - apk add --no-cache aws-cli || (wget -qO- https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip > /tmp/aws.zip && unzip /tmp/aws.zip -d /tmp && /tmp/aws/install)
+    - *install_awscli
     - *aws_env
   script:
     - cd "$TF_DIR"
