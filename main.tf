@@ -54,6 +54,10 @@ provider "helm" {
     token                  = data.aws_eks_cluster_auth.this.token
   }
 }
+
+# =====================
+# Variables
+# =====================
 variable "aws_region" {
   type    = string
   default = "us-east-1"
@@ -138,6 +142,10 @@ variable "frontend_url" {
   type    = string
   default = "http://localhost:4200"
 }
+
+# =====================
+# Data + locals
+# =====================
 data "aws_availability_zones" "available" {
   state = "available"
 }
@@ -149,6 +157,9 @@ locals {
   }
 }
 
+# =====================
+# VPC / networking
+# =====================
 resource "aws_vpc" "this" {
   cidr_block           = var.vpc_cidr
   enable_dns_support   = true
@@ -169,9 +180,9 @@ resource "aws_subnet" "public_a" {
   map_public_ip_on_launch = true
 
   tags = merge(local.common_tags, {
-    Name                                          = "ecommerce-subnet-public-a"
-    "kubernetes.io/role/elb"                      = "1"
-    "kubernetes.io/cluster/${var.cluster_name}"   = "shared"
+    Name                                        = "ecommerce-subnet-public-a"
+    "kubernetes.io/role/elb"                    = "1"
+    "kubernetes.io/cluster/${var.cluster_name}" = "shared"
   })
 }
 
@@ -182,9 +193,9 @@ resource "aws_subnet" "public_b" {
   map_public_ip_on_launch = true
 
   tags = merge(local.common_tags, {
-    Name                                          = "ecommerce-subnet-public-b"
-    "kubernetes.io/role/elb"                      = "1"
-    "kubernetes.io/cluster/${var.cluster_name}"   = "shared"
+    Name                                        = "ecommerce-subnet-public-b"
+    "kubernetes.io/role/elb"                    = "1"
+    "kubernetes.io/cluster/${var.cluster_name}" = "shared"
   })
 }
 
@@ -209,6 +220,9 @@ resource "aws_route_table_association" "b" {
   route_table_id = aws_route_table.public.id
 }
 
+# =====================
+# RDS security group
+# =====================
 resource "aws_security_group" "rds" {
   name        = "ecommerce-rds-sg"
   description = "RDS access from EKS - no public access"
@@ -216,7 +230,6 @@ resource "aws_security_group" "rds" {
   tags        = merge(local.common_tags, { Name = "ecommerce-rds-sg" })
 }
 
-# Allow EKS node SG to reach RDS on 3306
 resource "aws_security_group_rule" "rds_from_eks" {
   type                     = "ingress"
   from_port                = 3306
@@ -225,6 +238,10 @@ resource "aws_security_group_rule" "rds_from_eks" {
   security_group_id        = aws_security_group.rds.id
   source_security_group_id = aws_eks_cluster.this.vpc_config[0].cluster_security_group_id
 }
+
+# =====================
+# ECR
+# =====================
 resource "aws_ecr_repository" "backend" {
   name                 = var.backend_repo
   image_tag_mutability = "MUTABLE"
@@ -240,7 +257,9 @@ resource "aws_ecr_repository" "backend" {
   tags = local.common_tags
 }
 
-# App secret (DB creds for RDS managed secret are created by RDS itself).
+# =====================
+# Secrets Manager (app)
+# =====================
 resource "aws_secretsmanager_secret" "app" {
   name        = var.app_secret_name
   description = "Backend app secrets"
@@ -257,6 +276,7 @@ resource "aws_secretsmanager_secret_version" "app" {
     ignore_changes = [secret_string]
   }
 }
+
 # =====================
 # EKS cluster IAM role
 # =====================
@@ -396,6 +416,7 @@ resource "aws_eks_addon" "kube_proxy" {
   addon_name   = "kube-proxy"
   depends_on   = [aws_eks_node_group.backend]
 }
+
 # =====================
 # AWS Load Balancer Controller (IAM + Helm)
 # =====================
@@ -488,6 +509,7 @@ resource "helm_release" "alb_controller" {
     aws_eks_addon.kube_proxy,
   ]
 }
+
 # =====================
 # External Secrets Operator (Helm + IAM + ClusterSecretStore)
 # =====================
@@ -593,6 +615,7 @@ resource "kubernetes_manifest" "cluster_secret_store" {
     kubernetes_service_account.eso,
   ]
 }
+
 # =====================
 # Backend Deployment / Service / Ingress / ExternalSecret
 # =====================
@@ -787,6 +810,10 @@ resource "kubernetes_ingress_v1" "backend" {
 
   depends_on = [helm_release.alb_controller]
 }
+
+# =====================
+# Outputs
+# =====================
 output "vpc_id" {
   value = aws_vpc.this.id
 }
