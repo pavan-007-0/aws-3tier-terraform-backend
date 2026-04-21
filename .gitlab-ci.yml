@@ -10,7 +10,7 @@ variables:
   BACKEND_REPO: backend-repo
   IMAGE_TAG: latest
   CLUSTER_NAME: ecommerce-cluster
-  TF_DIR: terraform
+  TF_DIR: .
   TF_IN_AUTOMATION: "true"
 
 # Helper: every job that touches AWS or Terraform exports
@@ -47,7 +47,7 @@ validate-python-code:
   script:
     - |
       SYNTAX_ERRORS=0
-      for f in $(find . -name "*.py" -not -path "./__pycache__/*" -not -path "./terraform/*"); do
+      for f in $(find . -name "*.py" -not -path "./__pycache__/*"); do
         python3 -m py_compile "$f" 2>&1 || SYNTAX_ERRORS=$((SYNTAX_ERRORS + 1))
       done
       if [ $SYNTAX_ERRORS -gt 0 ]; then echo "Syntax errors found"; exit 1; fi
