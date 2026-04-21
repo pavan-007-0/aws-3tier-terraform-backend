@@ -11,6 +11,7 @@ variables:
   IMAGE_TAG: latest
   CLUSTER_NAME: ecommerce-cluster
   TF_DIR: .
+  TF_VERSION: "1.9.8"
   TF_IN_AUTOMATION: "true"
 
 # Helper: every job that touches AWS or Terraform exports
@@ -22,15 +23,14 @@ variables:
   - export STATE_BUCKET="tf-state-${AWS_ACCOUNT_ID}-${AWS_DEFAULT_REGION}"
   - echo "AWS account $AWS_ACCOUNT_ID  /  state bucket $STATE_BUCKET"
 
-# Helper: install AWS CLI v2 from the official zip on Alpine-based images
-# (do NOT use `apk add aws-cli` — Alpine's package is broken on the
-# hashicorp/terraform image due to a libexpat/Python ABI mismatch).
-.install_awscli: &install_awscli
-  - apk add --no-cache curl unzip
-  - curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/aws.zip
-  - unzip -q /tmp/aws.zip -d /tmp
-  - /tmp/aws/install -i /usr/local/aws-cli -b /usr/local/bin
-  - aws --version
+# Helper: install Terraform into the amazon/aws-cli image (glibc, has yum).
+# We do NOT use hashicorp/terraform image because AWS CLI v2 is glibc-only
+# and won't run on its musl/Alpine base.
+.install_terraform: &install_terraform
+  - yum install -y unzip >/dev/null
+  - curl -sSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o /tmp/tf.zip
+  - unzip -o /tmp/tf.zip -d /usr/local/bin
+  - terraform version
 
 # ==========================
 # STAGE 1 - VALIDATE
@@ -130,17 +130,16 @@ bootstrap-state-bucket:
 
 # ==========================
 # STAGE 3 - INFRA (Terraform)
-# Creates VPC, subnets, RDS SG, ECR, EKS cluster + nodegroup,
-# ALB controller, External Secrets Operator, ClusterSecretStore.
+# Image: amazon/aws-cli (glibc) + Terraform installed in before_script.
 # ==========================
 infra-apply:
   stage: infra
   image:
-    name: hashicorp/terraform:1.9
+    name: amazon/aws-cli
     entrypoint: [""]
   needs: ["bootstrap-state-bucket"]
   before_script:
-    - *install_awscli
+    - *install_terraform
     - *aws_env
   script:
     - cd "$TF_DIR"
@@ -169,8 +168,10 @@ build-backend:
     DOCKER_TLS_CERTDIR: ""
   needs: ["infra-apply", "validate-python-code", "validate-dockerfile"]
   before_script:
-    - *install_awscli
-    - *aws_env
+    - apk add --no-cache aws-cli
+    - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+    - 'if [ -z "$AWS_ACCOUNT_ID" ]; then echo "ERROR: failed to get AWS account ID"; exit 1; fi'
+    - export AWS_ACCOUNT_ID
   script:
     - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
     - docker build -t "$BACKEND_REPO:$IMAGE_TAG" .
@@ -186,11 +187,11 @@ build-backend:
 deploy-backend:
   stage: deploy
   image:
-    name: hashicorp/terraform:1.9
+    name: amazon/aws-cli
     entrypoint: [""]
   needs: ["build-backend"]
   before_script:
-    - *install_awscli
+    - *install_terraform
     - *aws_env
   script:
     - cd "$TF_DIR"
