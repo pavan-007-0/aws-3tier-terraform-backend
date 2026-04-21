@@ -1,33 +1,169 @@
-image: docker:24
-
-services:
-  - docker:24-dind
+stages:
+  - validate
+  - bootstrap
+  - infra
+  - build
+  - deploy
 
 variables:
-  DOCKER_TLS_CERTDIR: ""
   AWS_DEFAULT_REGION: us-east-1
   BACKEND_REPO: backend-repo
   IMAGE_TAG: latest
   CLUSTER_NAME: ecommerce-cluster
-  # Preserved from your CloudFormation parameters
-  VPC_ID: "vpc-0c94c781bb54a1008"
-  SUBNET_A: "subnet-0951f168b0769217c"
-  SUBNET_B: "subnet-0a61c37122c11d0f1"
-  RDS_SG_ID: "sg-0f5f53246f5b20572"
+  TF_DIR: terraform
+  TF_IN_AUTOMATION: "true"
 
-stages:
-  - build
-  - deploy
-
-before_script:
-  - apk add --no-cache aws-cli curl bash jq gettext
+# Helper: every job that touches AWS or Terraform exports
+# AWS_ACCOUNT_ID and STATE_BUCKET so init/apply work the same way.
+.aws_env: &aws_env
   - export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+  - export STATE_BUCKET="tf-state-${AWS_ACCOUNT_ID}-${AWS_DEFAULT_REGION}"
+  - echo "AWS account $AWS_ACCOUNT_ID  /  state bucket $STATE_BUCKET"
 
-# ================= BUILD =================
+# ==========================
+# STAGE 1 - VALIDATE
+# ==========================
+
+validate-aws-credentials:
+  stage: validate
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
+  script:
+    - aws sts get-caller-identity
+    - aws ec2 describe-availability-zones --region "$AWS_DEFAULT_REGION" --query "AvailabilityZones[0].State" --output text
+    - echo "AWS credentials OK"
+  only:
+    - main
+
+validate-python-code:
+  stage: validate
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
+  before_script:
+    - yum install -y python3-pip
+    - pip3 install pyflakes bandit flask flask-cors flask-limiter flask-wtf mysql-connector-python python-dotenv PyJWT Werkzeug cryptography bcrypt marshmallow email-validator requests gunicorn
+  script:
+    - |
+      SYNTAX_ERRORS=0
+      for f in $(find . -name "*.py" -not -path "./__pycache__/*" -not -path "./terraform/*"); do
+        python3 -m py_compile "$f" 2>&1 || SYNTAX_ERRORS=$((SYNTAX_ERRORS + 1))
+      done
+      if [ $SYNTAX_ERRORS -gt 0 ]; then echo "Syntax errors found"; exit 1; fi
+    - python3 -m pyflakes app.py auth.py db.py orders.py products.py cart.py admin.py security.py error_handlers.py 2>&1 || true
+    - python3 -m bandit -r app.py auth.py db.py orders.py products.py cart.py admin.py security.py error_handlers.py --severity-level high -f txt 2>&1 || true
+  only:
+    - main
+
+validate-dockerfile:
+  stage: validate
+  image: alpine:3.21
+  script:
+    - 'test -f Dockerfile || { echo "ERROR: Dockerfile not found"; exit 1; }'
+    - 'grep -qE "^FROM " Dockerfile || { echo "ERROR: FROM missing"; exit 1; }'
+    - 'grep -qE "^(COPY|ADD) " Dockerfile || { echo "ERROR: COPY/ADD missing"; exit 1; }'
+    - 'grep -qE "^(CMD|ENTRYPOINT) " Dockerfile || { echo "ERROR: CMD/ENTRYPOINT missing"; exit 1; }'
+    - 'test -s requirements.txt || { echo "ERROR: requirements.txt missing/empty"; exit 1; }'
+  only:
+    - main
+
+validate-terraform:
+  stage: validate
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  script:
+    - cd "$TF_DIR"
+    - terraform fmt -check -recursive
+    - terraform init -backend=false
+    - terraform validate
+  only:
+    - main
+
+# ==========================
+# STAGE 2 - BOOTSTRAP
+# Auto-create the S3 bucket Terraform will use for remote state.
+# Idempotent - safe on every run.
+# ==========================
+
+bootstrap-state-bucket:
+  stage: bootstrap
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
+  needs: ["validate-aws-credentials", "validate-terraform"]
+  before_script:
+    - *aws_env
+  script:
+    - |
+      if aws s3api head-bucket --bucket "$STATE_BUCKET" 2>/dev/null; then
+        echo "State bucket already exists: $STATE_BUCKET"
+      else
+        echo "Creating state bucket: $STATE_BUCKET"
+        if [ "$AWS_DEFAULT_REGION" = "us-east-1" ]; then
+          aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$AWS_DEFAULT_REGION"
+        else
+          aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$AWS_DEFAULT_REGION" \
+            --create-bucket-configuration LocationConstraint="$AWS_DEFAULT_REGION"
+        fi
+        aws s3api put-bucket-versioning --bucket "$STATE_BUCKET" \
+          --versioning-configuration Status=Enabled
+        aws s3api put-bucket-encryption --bucket "$STATE_BUCKET" \
+          --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+        aws s3api put-public-access-block --bucket "$STATE_BUCKET" \
+          --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+        echo "State bucket ready"
+      fi
+  only:
+    - main
+
+# ==========================
+# STAGE 3 - INFRA (Terraform)
+# Creates VPC, subnets, RDS SG, ECR, EKS cluster + nodegroup,
+# ALB controller, External Secrets Operator, ClusterSecretStore.
+# ==========================
+
+infra-apply:
+  stage: infra
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  needs: ["bootstrap-state-bucket"]
+  before_script:
+    - apk add --no-cache aws-cli || (wget -qO- https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip > /tmp/aws.zip && unzip /tmp/aws.zip -d /tmp && /tmp/aws/install)
+    - *aws_env
+  script:
+    - cd "$TF_DIR"
+    - terraform init -backend-config="bucket=$STATE_BUCKET"
+    - terraform apply -auto-approve
+    - terraform output -json > tf-outputs.json
+  artifacts:
+    paths:
+      - $TF_DIR/tf-outputs.json
+    expire_in: 1 day
+  timeout: 40m
+  only:
+    - main
+
+# ==========================
+# STAGE 4 - BUILD
+# Build backend image and push to the ECR created by Terraform.
+# ==========================
+
 build-backend:
   stage: build
+  image: alpine:3.21
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  needs: ["infra-apply", "validate-python-code", "validate-dockerfile"]
+  before_script:
+    - apk add --no-cache aws-cli docker-cli
+    - *aws_env
   script:
-    - aws ecr describe-repositories --repository-names "$BACKEND_REPO" || aws ecr create-repository --repository-name "$BACKEND_REPO"
     - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
     - docker build -t "$BACKEND_REPO:$IMAGE_TAG" .
     - docker tag "$BACKEND_REPO:$IMAGE_TAG" "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$BACKEND_REPO:$IMAGE_TAG"
@@ -35,180 +171,25 @@ build-backend:
   only:
     - main
 
-# ================= DEPLOY =================
+# ==========================
+# STAGE 5 - DEPLOY
+# Re-apply Terraform with -replace to roll out the new image.
+# ==========================
+
 deploy-backend:
   stage: deploy
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
   needs: ["build-backend"]
+  before_script:
+    - apk add --no-cache aws-cli || (wget -qO- https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip > /tmp/aws.zip && unzip /tmp/aws.zip -d /tmp && /tmp/aws/install)
+    - *aws_env
   script:
-    # 1. Install kubectl
-    - curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-    - chmod +x kubectl && mv kubectl /usr/local/bin/
-    
-    # 2. Update kubeconfig
-    - aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_DEFAULT_REGION"
-
-    # 3. Allow EKS Nodes to access RDS (Replaces 'AllowEcsToRds' CloudFormation rule)
-    - |
-      echo "🔐 Authorizing EKS nodes to access RDS Database..."
-      EKS_NODE_SG=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query "cluster.resourcesVpcConfig.clusterSecurityGroupId" --output text)
-      
-      # Check if rule already exists to avoid errors
-      RULE_EXISTS=$(aws ec2 describe-security-group-rules --filters Name="group-id",Values="$RDS_SG_ID" Name="ip-permission.to-port",Values="3306" Name="ip-permission.from-port",Values="3306" Name="ip-permission.protocol",Values="tcp" Name="ip-permission.user-id-group-pairs.group-id",Values="$EKS_NODE_SG" --query "SecurityGroupRules" --output text)
-      
-      if [ -z "$RULE_EXISTS" ]; then
-        aws ec2 authorize-security-group-ingress --group-id "$RDS_SG_ID" --protocol tcp --port 3306 --source-group "$EKS_NODE_SG" || true
-        echo "✅ Access granted from EKS ($EKS_NODE_SG) to RDS ($RDS_SG_ID)"
-      else
-        echo "✅ EKS to RDS security group rule already exists."
-      fi
-
-    # 4. Fetch Frontend URL for CORS (Preserved from old script)
-    - |
-      FRONTEND_URL=$(aws cloudformation describe-stacks --stack-name frontend-stack --query "Stacks[0].Outputs[?OutputKey=='FrontendURL'].OutputValue" --output text || echo "http://localhost:4200")
-      echo "Detected Frontend URL: $FRONTEND_URL"
-
-    # 5. Generate and Apply Kubernetes Manifests
-    - |
-      echo "📦 Deploying Kubernetes Manifests..."
-      cat > backend-manifests.yaml << EOF
-      apiVersion: external-secrets.io/v1beta1
-      kind: ExternalSecret
-      metadata:
-        name: backend-secrets
-        namespace: default
-      spec:
-        refreshInterval: 1h
-        secretStoreRef:
-          name: aws-secrets-manager
-          kind: ClusterSecretStore
-        target:
-          name: backend-secrets
-          create: true
-        data:
-        - secretKey: DB_USER
-          remoteRef:
-            key: "rds!db-bc9e1596-3d78-4991-8bd9-58e17d3073c1"
-            property: username
-        - secretKey: DB_PASSWORD
-          remoteRef:
-            key: "rds!db-bc9e1596-3d78-4991-8bd9-58e17d3073c1"
-            property: password
-        - secretKey: JWT_SECRET_KEY
-          remoteRef:
-            key: "app/backend/secrets"
-            property: JWT_SECRET_KEY
-        - secretKey: SECRET_KEY
-          remoteRef:
-            key: "app/backend/secrets"
-            property: SECRET_KEY
-      ---
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: backend
-        namespace: default
-      spec:
-        replicas: 1
-        selector:
-          matchLabels:
-            app: backend
-        template:
-          metadata:
-            labels:
-              app: backend
-          spec:
-            containers:
-            - name: backend
-              image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${BACKEND_REPO}:${IMAGE_TAG}
-              ports:
-              - containerPort: 5000
-              env:
-              - name: DB_HOST
-                value: "database-1-use1.cujgu046ilz9.us-east-1.rds.amazonaws.com"
-              - name: DB_NAME
-                value: "ecommerce_db"
-              - name: FLASK_ENV
-                value: "production"
-              - name: CORS_ORIGINS
-                value: "${FRONTEND_URL}"
-              - name: DB_USER
-                valueFrom:
-                  secretKeyRef:
-                    name: backend-secrets
-                    key: DB_USER
-              - name: DB_PASSWORD
-                valueFrom:
-                  secretKeyRef:
-                    name: backend-secrets
-                    key: DB_PASSWORD
-              - name: JWT_SECRET_KEY
-                valueFrom:
-                  secretKeyRef:
-                    name: backend-secrets
-                    key: JWT_SECRET_KEY
-              - name: SECRET_KEY
-                valueFrom:
-                  secretKeyRef:
-                    name: backend-secrets
-                    key: SECRET_KEY
-              resources:
-                requests:
-                  cpu: "256m"
-                  memory: "512Mi"
-      ---
-      apiVersion: v1
-      kind: Service
-      metadata:
-        name: backend
-        namespace: default
-      spec:
-        type: ClusterIP
-        selector:
-          app: backend
-        ports:
-        - port: 5000
-          targetPort: 5000
-          protocol: TCP
-      ---
-      apiVersion: networking.k8s.io/v1
-      kind: Ingress
-      metadata:
-        name: backend
-        namespace: default
-        annotations:
-          kubernetes.io/ingress.class: alb
-          alb.ingress.kubernetes.io/scheme: internet-facing
-          alb.ingress.kubernetes.io/target-type: ip
-          alb.ingress.kubernetes.io/subnets: ${SUBNET_A}, ${SUBNET_B}
-          alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
-          alb.ingress.kubernetes.io/healthcheck-path: /health
-      spec:
-        rules:
-        - http:
-            paths:
-            - path: /
-              pathType: Prefix
-              backend:
-                service:
-                  name: backend
-                  port:
-                    number: 5000
-      EOF
-      
-      kubectl apply -f backend-manifests.yaml
-      kubectl rollout status deployment/backend -n default --timeout=300s
-      echo "✅ Backend successfully deployed to EKS!"
-
-    # 6. Get the new ALB URL
-    - |
-      echo "⏳ Waiting for ALB Load Balancer to provision..."
-      for i in {1..120}; do
-        BACKEND_URL=$(kubectl get ingress backend -n default -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-        if [ -n "$BACKEND_URL" ]; then
-          echo "🎉 BACKEND LIVE AT: http://$BACKEND_URL"
-          break
-        fi
-        sleep 5
-      done
+    - cd "$TF_DIR"
+    - terraform init -backend-config="bucket=$STATE_BUCKET"
+    - terraform apply -auto-approve -replace=kubernetes_deployment_v1.backend
+    - echo "Backend ALB hostname:"
+    - terraform output -raw backend_alb_hostname || true
   only:
     - main
