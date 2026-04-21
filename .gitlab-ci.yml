@@ -14,8 +14,7 @@ variables:
   TF_VERSION: "1.9.8"
   TF_IN_AUTOMATION: "true"
 
-# Helper: every job that touches AWS or Terraform exports
-# AWS_ACCOUNT_ID and STATE_BUCKET so init/apply work the same way.
+# Resolve AWS account + state bucket name. Fail fast if creds are broken.
 .aws_env: &aws_env
   - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
   - 'if [ -z "$AWS_ACCOUNT_ID" ]; then echo "ERROR: failed to get AWS account ID"; exit 1; fi'
@@ -23,9 +22,7 @@ variables:
   - export STATE_BUCKET="tf-state-${AWS_ACCOUNT_ID}-${AWS_DEFAULT_REGION}"
   - echo "AWS account $AWS_ACCOUNT_ID  /  state bucket $STATE_BUCKET"
 
-# Helper: install Terraform into the amazon/aws-cli image (glibc, has yum).
-# We do NOT use hashicorp/terraform image because AWS CLI v2 is glibc-only
-# and won't run on its musl/Alpine base.
+# Install Terraform into amazon/aws-cli (glibc) image.
 .install_terraform: &install_terraform
   - yum install -y unzip >/dev/null
   - curl -sSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o /tmp/tf.zip
@@ -94,8 +91,7 @@ validate-terraform:
 
 # ==========================
 # STAGE 2 - BOOTSTRAP
-# Auto-create the S3 bucket Terraform will use for remote state.
-# Idempotent - safe on every run.
+# Idempotent S3 state bucket creation.
 # ==========================
 bootstrap-state-bucket:
   stage: bootstrap
@@ -130,7 +126,8 @@ bootstrap-state-bucket:
 
 # ==========================
 # STAGE 3 - INFRA (Terraform)
-# Image: amazon/aws-cli (glibc) + Terraform installed in before_script.
+# Two-stage apply: kubernetes_manifest needs the API server alive at PLAN time,
+# so we create EKS + Helm releases first, then run a full apply.
 # ==========================
 infra-apply:
   stage: infra
@@ -144,19 +141,33 @@ infra-apply:
   script:
     - cd "$TF_DIR"
     - terraform init -backend-config="bucket=$STATE_BUCKET"
+    # Stage 1: stand up cluster, addons, controllers, ESO
+    - |
+      terraform apply -auto-approve \
+        -target=aws_eks_cluster.this \
+        -target=aws_eks_node_group.backend \
+        -target=aws_eks_addon.vpc_cni \
+        -target=aws_eks_addon.coredns \
+        -target=aws_eks_addon.kube_proxy \
+        -target=kubernetes_service_account.alb_controller \
+        -target=helm_release.alb_controller \
+        -target=kubernetes_namespace.eso \
+        -target=helm_release.eso \
+        -target=kubernetes_service_account.eso
+    # Stage 2: full apply (kubernetes_manifest can now reach the API)
     - terraform apply -auto-approve
     - terraform output -json > tf-outputs.json
   artifacts:
     paths:
       - $TF_DIR/tf-outputs.json
     expire_in: 1 day
-  timeout: 40m
+  timeout: 60m
   only:
     - main
 
 # ==========================
 # STAGE 4 - BUILD
-# Build backend image and push to the ECR created by Terraform.
+# Build backend image and push to ECR.
 # ==========================
 build-backend:
   stage: build
@@ -182,7 +193,7 @@ build-backend:
 
 # ==========================
 # STAGE 5 - DEPLOY
-# Re-apply Terraform with -replace to roll out the new image.
+# Re-apply to roll out the new image.
 # ==========================
 deploy-backend:
   stage: deploy
