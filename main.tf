@@ -24,8 +24,6 @@ terraform {
     }
   }
 
-  # Bucket name is supplied by the pipeline via:
-  #   terraform init -backend-config="bucket=$STATE_BUCKET"
   backend "s3" {
     key    = "ecommerce/backend/terraform.tfstate"
     region = "us-east-1"
@@ -213,3 +211,648 @@ resource "aws_route_table" "public" {
 
 resource "aws_route_table_association" "a" {
   subnet_id      = aws_subnet.public_a.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "b" {
+  subnet_id      = aws_subnet.public_b.id
+  route_table_id = aws_route_table.public.id
+}
+
+# =====================
+# RDS security group
+# =====================
+resource "aws_security_group" "rds" {
+  name        = "ecommerce-rds-sg"
+  description = "RDS access from EKS - no public access"
+  vpc_id      = aws_vpc.this.id
+  tags        = merge(local.common_tags, { Name = "ecommerce-rds-sg" })
+}
+
+resource "aws_security_group_rule" "rds_from_eks" {
+  type                     = "ingress"
+  from_port                = 3306
+  to_port                  = 3306
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.rds.id
+  source_security_group_id = aws_eks_cluster.this.vpc_config[0].cluster_security_group_id
+}
+
+# =====================
+# ECR
+# =====================
+resource "aws_ecr_repository" "backend" {
+  name                 = var.backend_repo
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+
+  tags = local.common_tags
+}
+
+# =====================
+# Secrets Manager (app)
+# =====================
+resource "aws_secretsmanager_secret" "app" {
+  name        = var.app_secret_name
+  description = "Backend app secrets"
+  tags        = local.common_tags
+}
+
+resource "aws_secretsmanager_secret_version" "app" {
+  secret_id = aws_secretsmanager_secret.app.id
+  secret_string = jsonencode({
+    JWT_SECRET_KEY = "change-me-jwt-secret"
+    SECRET_KEY     = "change-me-secret-key"
+  })
+  lifecycle {
+    ignore_changes = [secret_string]
+  }
+}
+
+# =====================
+# EKS cluster IAM role
+# =====================
+data "aws_iam_policy_document" "eks_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["eks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "eks_cluster" {
+  name               = "${var.cluster_name}-cluster-role"
+  assume_role_policy = data.aws_iam_policy_document.eks_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
+  role       = aws_iam_role.eks_cluster.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+}
+
+# =====================
+# EKS cluster
+# =====================
+resource "aws_eks_cluster" "this" {
+  name     = var.cluster_name
+  role_arn = aws_iam_role.eks_cluster.arn
+  version  = var.eks_version
+
+  vpc_config {
+    subnet_ids              = [aws_subnet.public_a.id, aws_subnet.public_b.id]
+    endpoint_public_access  = true
+    endpoint_private_access = false
+  }
+
+  access_config {
+    authentication_mode                         = "API_AND_CONFIG_MAP"
+    bootstrap_cluster_creator_admin_permissions = true
+  }
+
+  depends_on = [aws_iam_role_policy_attachment.eks_cluster_policy]
+}
+
+resource "aws_security_group_rule" "cluster_sg_self" {
+  type                     = "ingress"
+  from_port                = 0
+  to_port                  = 65535
+  protocol                 = "-1"
+  security_group_id        = aws_eks_cluster.this.vpc_config[0].cluster_security_group_id
+  source_security_group_id = aws_eks_cluster.this.vpc_config[0].cluster_security_group_id
+  description              = "Allow node-to-node and node-to-control-plane"
+}
+
+data "tls_certificate" "oidc" {
+  url = aws_eks_cluster.this.identity[0].oidc[0].issuer
+}
+
+resource "aws_iam_openid_connect_provider" "this" {
+  url             = aws_eks_cluster.this.identity[0].oidc[0].issuer
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = [data.tls_certificate.oidc.certificates[0].sha1_fingerprint]
+}
+
+# =====================
+# Node group IAM role
+# =====================
+data "aws_iam_policy_document" "node_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "node" {
+  name               = "${var.cluster_name}-node-role"
+  assume_role_policy = data.aws_iam_policy_document.node_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "node_worker" {
+  role       = aws_iam_role.node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+}
+
+resource "aws_iam_role_policy_attachment" "node_cni" {
+  role       = aws_iam_role.node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+}
+
+resource "aws_iam_role_policy_attachment" "node_ecr" {
+  role       = aws_iam_role.node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+resource "aws_iam_role_policy_attachment" "node_elb" {
+  role       = aws_iam_role.node.name
+  policy_arn = "arn:aws:iam::aws:policy/ElasticLoadBalancingFullAccess"
+}
+
+# =====================
+# Managed node group
+# =====================
+resource "aws_eks_node_group" "backend" {
+  cluster_name    = aws_eks_cluster.this.name
+  node_group_name = "backend-nodes"
+  node_role_arn   = aws_iam_role.node.arn
+  subnet_ids      = [aws_subnet.public_a.id, aws_subnet.public_b.id]
+  instance_types  = [var.node_instance_type]
+  ami_type        = "AL2023_x86_64_STANDARD"
+  capacity_type   = "ON_DEMAND"
+  disk_size       = 20
+
+  scaling_config {
+    desired_size = var.node_desired
+    min_size     = var.node_min
+    max_size     = var.node_max
+  }
+
+  update_config {
+    max_unavailable = 1
+  }
+
+  depends_on = [
+    aws_route_table_association.a,
+    aws_route_table_association.b,
+    aws_security_group_rule.cluster_sg_self,
+    aws_iam_role_policy_attachment.node_worker,
+    aws_iam_role_policy_attachment.node_cni,
+    aws_iam_role_policy_attachment.node_ecr,
+    aws_iam_role_policy_attachment.node_elb,
+  ]
+}
+
+# =====================
+# Core add-ons
+# =====================
+resource "aws_eks_addon" "vpc_cni" {
+  cluster_name = aws_eks_cluster.this.name
+  addon_name   = "vpc-cni"
+  depends_on   = [aws_eks_node_group.backend]
+}
+
+resource "aws_eks_addon" "coredns" {
+  cluster_name = aws_eks_cluster.this.name
+  addon_name   = "coredns"
+  depends_on   = [aws_eks_node_group.backend]
+}
+
+resource "aws_eks_addon" "kube_proxy" {
+  cluster_name = aws_eks_cluster.this.name
+  addon_name   = "kube-proxy"
+  depends_on   = [aws_eks_node_group.backend]
+}
+
+# =====================
+# AWS Load Balancer Controller
+# =====================
+data "http" "alb_iam_policy" {
+  url = "https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json"
+}
+
+resource "aws_iam_policy" "alb_controller" {
+  name   = "AWSLoadBalancerControllerIAMPolicy"
+  policy = data.http.alb_iam_policy.response_body
+}
+
+locals {
+  oidc_provider_url = replace(aws_iam_openid_connect_provider.this.url, "https://", "")
+}
+
+data "aws_iam_policy_document" "alb_controller_assume" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.this.arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "${local.oidc_provider_url}:sub"
+      values   = ["system:serviceaccount:kube-system:aws-load-balancer-controller"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "${local.oidc_provider_url}:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "alb_controller" {
+  name               = "AWSLoadBalancerControllerRole"
+  assume_role_policy = data.aws_iam_policy_document.alb_controller_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "alb_controller" {
+  role       = aws_iam_role.alb_controller.name
+  policy_arn = aws_iam_policy.alb_controller.arn
+}
+resource "kubernetes_service_account" "alb_controller" {
+  metadata {
+    name      = "aws-load-balancer-controller"
+    namespace = "kube-system"
+    annotations = {
+      "eks.amazonaws.com/role-arn" = aws_iam_role.alb_controller.arn
+    }
+  }
+  depends_on = [aws_eks_node_group.backend]
+}
+
+resource "helm_release" "alb_controller" {
+  name       = "aws-load-balancer-controller"
+  repository = "https://aws.github.io/eks-charts"
+  chart      = "aws-load-balancer-controller"
+  namespace  = "kube-system"
+  wait       = true
+
+  set {
+    name  = "clusterName"
+    value = aws_eks_cluster.this.name
+  }
+  set {
+    name  = "serviceAccount.create"
+    value = "false"
+  }
+  set {
+    name  = "serviceAccount.name"
+    value = "aws-load-balancer-controller"
+  }
+  set {
+    name  = "region"
+    value = var.aws_region
+  }
+  set {
+    name  = "vpcId"
+    value = aws_vpc.this.id
+  }
+
+  depends_on = [
+    kubernetes_service_account.alb_controller,
+    aws_eks_addon.vpc_cni,
+    aws_eks_addon.coredns,
+    aws_eks_addon.kube_proxy,
+  ]
+}
+
+# =====================
+# External Secrets Operator
+# =====================
+resource "aws_iam_policy" "eso" {
+  name = "ExternalSecretsPolicy"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret",
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
+data "aws_iam_policy_document" "eso_assume" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.this.arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "${local.oidc_provider_url}:sub"
+      values   = ["system:serviceaccount:external-secrets:external-secrets-sa"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "${local.oidc_provider_url}:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "eso" {
+  name               = "ExternalSecretsRole"
+  assume_role_policy = data.aws_iam_policy_document.eso_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "eso" {
+  role       = aws_iam_role.eso.name
+  policy_arn = aws_iam_policy.eso.arn
+}
+
+resource "kubernetes_namespace" "eso" {
+  metadata {
+    name = "external-secrets"
+  }
+  depends_on = [aws_eks_node_group.backend]
+}
+
+resource "helm_release" "eso" {
+  name       = "external-secrets"
+  repository = "https://charts.external-secrets.io"
+  chart      = "external-secrets"
+  namespace  = kubernetes_namespace.eso.metadata[0].name
+  version    = var.eso_chart_version
+  wait       = true
+}
+
+resource "kubernetes_service_account" "eso" {
+  metadata {
+    name      = "external-secrets-sa"
+    namespace = kubernetes_namespace.eso.metadata[0].name
+    annotations = {
+      "eks.amazonaws.com/role-arn" = aws_iam_role.eso.arn
+    }
+  }
+  depends_on = [helm_release.eso]
+}
+
+resource "kubernetes_manifest" "cluster_secret_store" {
+  manifest = {
+    apiVersion = "external-secrets.io/v1"
+    kind       = "ClusterSecretStore"
+    metadata = {
+      name = "aws-secrets-manager"
+    }
+    spec = {
+      provider = {
+        aws = {
+          service = "SecretsManager"
+          region  = var.aws_region
+          auth = {
+            jwt = {
+              serviceAccountRef = {
+                name      = "external-secrets-sa"
+                namespace = "external-secrets"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    helm_release.eso,
+    kubernetes_service_account.eso,
+  ]
+}
+
+# =====================
+# Backend workload
+# =====================
+locals {
+  backend_image = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/${var.backend_repo}:${var.image_tag}"
+}
+
+resource "kubernetes_manifest" "backend_external_secret" {
+  manifest = {
+    apiVersion = "external-secrets.io/v1"
+    kind       = "ExternalSecret"
+    metadata = {
+      name      = "backend-secrets"
+      namespace = "default"
+    }
+    spec = {
+      refreshInterval = "1h"
+      secretStoreRef = {
+        name = "aws-secrets-manager"
+        kind = "ClusterSecretStore"
+      }
+      target = {
+        name           = "backend-secrets"
+        creationPolicy = "Owner"
+      }
+      data = [
+        {
+          secretKey = "DB_USER"
+          remoteRef = { key = var.rds_secret_name, property = "username" }
+        },
+        {
+          secretKey = "DB_PASSWORD"
+          remoteRef = { key = var.rds_secret_name, property = "password" }
+        },
+        {
+          secretKey = "JWT_SECRET_KEY"
+          remoteRef = { key = var.app_secret_name, property = "JWT_SECRET_KEY" }
+        },
+        {
+          secretKey = "SECRET_KEY"
+          remoteRef = { key = var.app_secret_name, property = "SECRET_KEY" }
+        },
+      ]
+    }
+  }
+
+  depends_on = [kubernetes_manifest.cluster_secret_store]
+}
+
+resource "kubernetes_deployment_v1" "backend" {
+  metadata {
+    name      = "backend"
+    namespace = "default"
+    labels    = { app = "backend" }
+  }
+
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "backend" }
+    }
+    template {
+      metadata {
+        labels = { app = "backend" }
+      }
+      spec {
+        container {
+          name  = "backend"
+          image = local.backend_image
+
+          port {
+            container_port = 5000
+          }
+
+          env {
+            name  = "DB_HOST"
+            value = var.rds_endpoint
+          }
+          env {
+            name  = "DB_NAME"
+            value = "ecommerce_db"
+          }
+          env {
+            name  = "FLASK_ENV"
+            value = "production"
+          }
+          env {
+            name  = "CORS_ORIGINS"
+            value = var.frontend_url
+          }
+          env {
+            name = "DB_USER"
+            value_from {
+              secret_key_ref {
+                name = "backend-secrets"
+                key  = "DB_USER"
+              }
+            }
+          }
+          env {
+            name = "DB_PASSWORD"
+            value_from {
+              secret_key_ref {
+                name = "backend-secrets"
+                key  = "DB_PASSWORD"
+              }
+            }
+          }
+          env {
+            name = "JWT_SECRET_KEY"
+            value_from {
+              secret_key_ref {
+                name = "backend-secrets"
+                key  = "JWT_SECRET_KEY"
+              }
+            }
+          }
+          env {
+            name = "SECRET_KEY"
+            value_from {
+              secret_key_ref {
+                name = "backend-secrets"
+                key  = "SECRET_KEY"
+              }
+            }
+          }
+
+          resources {
+            requests = {
+              cpu    = "256m"
+              memory = "512Mi"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [kubernetes_manifest.backend_external_secret]
+}
+
+resource "kubernetes_service_v1" "backend" {
+  metadata {
+    name      = "backend"
+    namespace = "default"
+  }
+  spec {
+    type     = "ClusterIP"
+    selector = { app = "backend" }
+    port {
+      port        = 5000
+      target_port = 5000
+      protocol    = "TCP"
+    }
+  }
+}
+
+resource "kubernetes_ingress_v1" "backend" {
+  metadata {
+    name      = "backend"
+    namespace = "default"
+    annotations = {
+      "kubernetes.io/ingress.class"                = "alb"
+      "alb.ingress.kubernetes.io/scheme"           = "internet-facing"
+      "alb.ingress.kubernetes.io/target-type"      = "ip"
+      "alb.ingress.kubernetes.io/subnets"          = "${aws_subnet.public_a.id},${aws_subnet.public_b.id}"
+      "alb.ingress.kubernetes.io/listen-ports"     = "[{\"HTTP\": 80}]"
+      "alb.ingress.kubernetes.io/healthcheck-path" = "/health"
+    }
+  }
+
+  spec {
+    rule {
+      http {
+        path {
+          path      = "/"
+          path_type = "Prefix"
+          backend {
+            service {
+              name = kubernetes_service_v1.backend.metadata[0].name
+              port {
+                number = 5000
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [helm_release.alb_controller]
+}
+
+# =====================
+# Outputs
+# =====================
+output "vpc_id" {
+  value = aws_vpc.this.id
+}
+
+output "subnet_a_id" {
+  value = aws_subnet.public_a.id
+}
+
+output "subnet_b_id" {
+  value = aws_subnet.public_b.id
+}
+
+output "cluster_name" {
+  value = aws_eks_cluster.this.name
+}
+
+output "cluster_endpoint" {
+  value = aws_eks_cluster.this.endpoint
+}
+
+output "ecr_backend_url" {
+  value = aws_ecr_repository.backend.repository_url
+}
+
+output "backend_alb_hostname" {
+  value       = try(kubernetes_ingress_v1.backend.status[0].load_balancer[0].ingress[0].hostname, "")
+  description = "Backend ALB DNS - takes ~3-5 min to populate after first apply"
+}
