@@ -248,11 +248,6 @@ resource "aws_ecr_repository" "backend" {
     encryption_type = "AES256"
   }
 
-  # FIX: allow re-runs to adopt an existing repo instead of failing
-  lifecycle {
-    ignore_changes = [tags]
-  }
-
   tags = local.common_tags
 }
 
@@ -264,9 +259,7 @@ data "aws_secretsmanager_secret" "app" {
 }
 
 # =====================
-# EKS cluster IAM role
-# FIX: added lifecycle create_before_destroy = false and ignore_changes
-#      so re-runs that import the role don't try to recreate it.
+# EKS cluster IAM role + cluster
 # =====================
 data "aws_iam_policy_document" "eks_assume" {
   statement {
@@ -281,13 +274,6 @@ data "aws_iam_policy_document" "eks_assume" {
 resource "aws_iam_role" "eks_cluster" {
   name               = "${var.cluster_name}-cluster-role"
   assume_role_policy = data.aws_iam_policy_document.eks_assume.json
-
-  # FIX: prevents "EntityAlreadyExists" when role was left behind
-  # by a partial destroy. The CI script imports it; Terraform then
-  # manages it going forward without trying to recreate it.
-  lifecycle {
-    ignore_changes = [assume_role_policy]
-  }
 }
 
 resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
@@ -295,9 +281,6 @@ resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
 }
 
-# =====================
-# EKS Cluster
-# =====================
 resource "aws_eks_cluster" "this" {
   name     = var.cluster_name
   role_arn = aws_iam_role.eks_cluster.arn
@@ -317,12 +300,6 @@ resource "aws_eks_cluster" "this" {
   depends_on = [aws_iam_role_policy_attachment.eks_cluster_policy]
 }
 
-# =====================
-# OIDC provider
-# FIX: thumbprint_list is in ignore_changes because AWS manages
-#      thumbprint rotation automatically; removing it from ignore_changes
-#      causes unnecessary replace cycles.
-# =====================
 data "tls_certificate" "oidc" {
   url = aws_eks_cluster.this.identity[0].oidc[0].issuer
 }
@@ -338,8 +315,7 @@ resource "aws_iam_openid_connect_provider" "this" {
 }
 
 # =====================
-# Node group IAM role
-# FIX: same lifecycle pattern as eks_cluster role
+# Node group IAM role + node group
 # =====================
 data "aws_iam_policy_document" "node_assume" {
   statement {
@@ -354,10 +330,6 @@ data "aws_iam_policy_document" "node_assume" {
 resource "aws_iam_role" "node" {
   name               = "${var.cluster_name}-node-role"
   assume_role_policy = data.aws_iam_policy_document.node_assume.json
-
-  lifecycle {
-    ignore_changes = [assume_role_policy]
-  }
 }
 
 resource "aws_iam_role_policy_attachment" "node_worker" {
@@ -424,9 +396,7 @@ resource "aws_eks_addon" "kube_proxy" {
 }
 
 # =====================
-# AWS Load Balancer Controller
-# FIX: helm chart version bumped from 3.2.2 → 1.11.0 (3.x does not exist;
-#      the chart uses 1.x versioning on the eks-charts repo)
+# AWS Load Balancer Controller (uses existing IAM policy)
 # =====================
 data "aws_iam_policy" "alb_controller" {
   name = "AWSLoadBalancerControllerIAMPolicy"
@@ -459,10 +429,6 @@ data "aws_iam_policy_document" "alb_controller_assume" {
 resource "aws_iam_role" "alb_controller" {
   name               = "AWSLoadBalancerControllerRole"
   assume_role_policy = data.aws_iam_policy_document.alb_controller_assume.json
-
-  lifecycle {
-    ignore_changes = [assume_role_policy]
-  }
 }
 
 resource "aws_iam_role_policy_attachment" "alb_controller" {
@@ -486,8 +452,6 @@ resource "helm_release" "alb_controller" {
   repository = "https://aws.github.io/eks-charts"
   chart      = "aws-load-balancer-controller"
   namespace  = "kube-system"
-  # FIX: corrected version — chart follows 1.x not 3.x
-  version    = "1.11.0"
   wait       = true
   timeout    = 600
 
@@ -525,7 +489,7 @@ resource "helm_release" "alb_controller" {
 }
 
 # =====================
-# External Secrets Operator
+# External Secrets Operator (uses existing IAM policy)
 # =====================
 data "aws_iam_policy" "eso" {
   name = "ExternalSecretsPolicy"
@@ -554,10 +518,6 @@ data "aws_iam_policy_document" "eso_assume" {
 resource "aws_iam_role" "eso" {
   name               = "ExternalSecretsRole"
   assume_role_policy = data.aws_iam_policy_document.eso_assume.json
-
-  lifecycle {
-    ignore_changes = [assume_role_policy]
-  }
 }
 
 resource "aws_iam_role_policy_attachment" "eso" {
