@@ -8,7 +8,7 @@ stages:
 variables:
   AWS_DEFAULT_REGION: "us-east-1"
   TF_VERSION: "1.9.8"
-  TF_DIR: "terraform"
+  TF_DIR: "."
   ECR_REPO: "backend-repo"
   IMAGE_TAG: "latest"
 
@@ -23,7 +23,9 @@ validate-terraform:
 
 validate-aws-credentials:
   stage: validate
-  image: amazon/aws-cli
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
   script:
     - aws sts get-caller-identity
 
@@ -42,7 +44,9 @@ validate-python-code:
 
 bootstrap-state-bucket:
   stage: bootstrap
-  image: amazon/aws-cli
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
   script:
     - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
     - STATE_BUCKET="tf-state-${AWS_ACCOUNT_ID}-${AWS_DEFAULT_REGION}"
@@ -63,7 +67,9 @@ bootstrap-state-bucket:
 
 infra-apply:
   stage: infra
-  image: amazon/aws-cli
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
   script:
     - yum install -y unzip >/dev/null
     - curl -sSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o /tmp/tf.zip
@@ -80,7 +86,7 @@ infra-apply:
     - terraform apply -auto-approve
   artifacts:
     paths:
-      - $TF_DIR/.terraform.lock.hcl
+      - .terraform.lock.hcl
     expire_in: 1 day
 
 build:
@@ -100,7 +106,9 @@ build:
 
 deploy:
   stage: deploy
-  image: amazon/aws-cli
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
   script:
     - yum install -y curl >/dev/null
     - curl -sLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.32.0/bin/linux/amd64/kubectl"
