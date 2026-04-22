@@ -18,14 +18,8 @@ terraform {
       source  = "hashicorp/tls"
       version = "~> 4.0"
     }
-    http = {
-      source  = "hashicorp/http"
-      version = "~> 3.4"
-    }
   }
 
-  # Bucket name supplied by the pipeline:
-  #   terraform init -backend-config="bucket=$STATE_BUCKET"
   backend "s3" {
     key    = "ecommerce/backend/terraform.tfstate"
     region = "us-east-1"
@@ -242,23 +236,10 @@ resource "aws_ecr_repository" "backend" {
 }
 
 # =====================
-# Secrets Manager (app secret)
+# Secrets Manager (app secret) - reference existing
 # =====================
-resource "aws_secretsmanager_secret" "app" {
-  name        = var.app_secret_name
-  description = "Backend app secrets"
-  tags        = local.common_tags
-}
-
-resource "aws_secretsmanager_secret_version" "app" {
-  secret_id = aws_secretsmanager_secret.app.id
-  secret_string = jsonencode({
-    JWT_SECRET_KEY = "change-me-jwt-secret"
-    SECRET_KEY     = "change-me-secret-key"
-  })
-  lifecycle {
-    ignore_changes = [secret_string]
-  }
+data "aws_secretsmanager_secret" "app" {
+  name = var.app_secret_name
 }
 
 # =====================
@@ -400,15 +381,10 @@ resource "aws_eks_addon" "kube_proxy" {
 }
 
 # =====================
-# AWS Load Balancer Controller (IAM + Helm)
+# AWS Load Balancer Controller (IAM + Helm) - reference existing IAM policy
 # =====================
-data "http" "alb_iam_policy" {
-  url = "https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json"
-}
-
-resource "aws_iam_policy" "alb_controller" {
-  name   = "AWSLoadBalancerControllerIAMPolicy"
-  policy = data.http.alb_iam_policy.response_body
+data "aws_iam_policy" "alb_controller" {
+  name = "AWSLoadBalancerControllerIAMPolicy"
 }
 
 locals {
@@ -442,7 +418,7 @@ resource "aws_iam_role" "alb_controller" {
 
 resource "aws_iam_role_policy_attachment" "alb_controller" {
   role       = aws_iam_role.alb_controller.name
-  policy_arn = aws_iam_policy.alb_controller.arn
+  policy_arn = data.aws_iam_policy.alb_controller.arn
 }
 
 resource "kubernetes_service_account" "alb_controller" {
@@ -494,21 +470,10 @@ resource "helm_release" "alb_controller" {
 }
 
 # =====================
-# External Secrets Operator (Helm + IAM + ClusterSecretStore)
+# External Secrets Operator (Helm + IAM + ClusterSecretStore) - reference existing IAM policy
 # =====================
-resource "aws_iam_policy" "eso" {
+data "aws_iam_policy" "eso" {
   name = "ExternalSecretsPolicy"
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "secretsmanager:GetSecretValue",
-        "secretsmanager:DescribeSecret",
-      ]
-      Resource = "*"
-    }]
-  })
 }
 
 data "aws_iam_policy_document" "eso_assume" {
@@ -538,7 +503,7 @@ resource "aws_iam_role" "eso" {
 
 resource "aws_iam_role_policy_attachment" "eso" {
   role       = aws_iam_role.eso.name
-  policy_arn = aws_iam_policy.eso.arn
+  policy_arn = data.aws_iam_policy.eso.arn
 }
 
 resource "kubernetes_namespace" "eso" {
@@ -643,6 +608,8 @@ resource "kubernetes_deployment_v1" "backend" {
     namespace = "default"
     labels    = { app = "backend" }
   }
+
+  wait_for_rollout = false
 
   spec {
     replicas = 1
@@ -802,7 +769,6 @@ output "cluster_endpoint" {
 output "ecr_backend_url" {
   value = aws_ecr_repository.backend.repository_url
 }
-
 output "backend_alb_hostname" {
   value       = try(kubernetes_ingress_v1.backend.status[0].load_balancer[0].ingress[0].hostname, "")
   description = "Backend ALB DNS - takes ~3-5 min to populate after first apply"
