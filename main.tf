@@ -24,6 +24,8 @@ terraform {
     }
   }
 
+  # Bucket name supplied by the pipeline:
+  #   terraform init -backend-config="bucket=$STATE_BUCKET"
   backend "s3" {
     key    = "ecommerce/backend/terraform.tfstate"
     region = "us-east-1"
@@ -59,82 +61,66 @@ variable "aws_region" {
   type    = string
   default = "us-east-1"
 }
-
 variable "cluster_name" {
   type    = string
   default = "ecommerce-cluster"
 }
-
 variable "eks_version" {
   type    = string
   default = "1.32"
 }
-
 variable "vpc_cidr" {
   type    = string
   default = "10.0.0.0/16"
 }
-
 variable "subnet_a_cidr" {
   type    = string
   default = "10.0.1.0/24"
 }
-
 variable "subnet_b_cidr" {
   type    = string
   default = "10.0.2.0/24"
 }
-
 variable "node_instance_type" {
   type    = string
   default = "t3.medium"
 }
-
 variable "node_min" {
   type    = number
   default = 1
 }
-
 variable "node_max" {
   type    = number
   default = 3
 }
-
 variable "node_desired" {
   type    = number
   default = 2
 }
-
 variable "backend_repo" {
   type    = string
   default = "backend-repo"
 }
-
 variable "image_tag" {
   type    = string
   default = "latest"
 }
-
 variable "rds_endpoint" {
   type    = string
   default = "database-1.coxucmkk0rho.us-east-1.rds.amazonaws.com"
 }
-
 variable "rds_secret_name" {
   type    = string
   default = "rds!db-a31a37c1-ddb2-4685-a5c6-dbd11475e1ab"
 }
-
 variable "app_secret_name" {
   type    = string
   default = "secrets/backend/app"
 }
-
 variable "eso_chart_version" {
   type    = string
   default = "0.20.4"
 }
-
 variable "frontend_url" {
   type    = string
   default = "http://localhost:4200"
@@ -163,8 +149,7 @@ resource "aws_vpc" "this" {
   cidr_block           = var.vpc_cidr
   enable_dns_support   = true
   enable_dns_hostnames = true
-
-  tags = merge(local.common_tags, { Name = "ecommerce-vpc" })
+  tags                 = merge(local.common_tags, { Name = "ecommerce-vpc" })
 }
 
 resource "aws_internet_gateway" "this" {
@@ -220,11 +205,11 @@ resource "aws_route_table_association" "b" {
 }
 
 # =====================
-# RDS security group
+# RDS security group (EKS -> RDS:3306)
 # =====================
 resource "aws_security_group" "rds" {
   name        = "ecommerce-rds-sg"
-  description = "RDS access from EKS - no public access"
+  description = "RDS access from EKS"
   vpc_id      = aws_vpc.this.id
   tags        = merge(local.common_tags, { Name = "ecommerce-rds-sg" })
 }
@@ -257,7 +242,7 @@ resource "aws_ecr_repository" "backend" {
 }
 
 # =====================
-# Secrets Manager (app)
+# Secrets Manager (app secret)
 # =====================
 resource "aws_secretsmanager_secret" "app" {
   name        = var.app_secret_name
@@ -277,7 +262,7 @@ resource "aws_secretsmanager_secret_version" "app" {
 }
 
 # =====================
-# EKS cluster IAM role
+# EKS cluster IAM role + cluster
 # =====================
 data "aws_iam_policy_document" "eks_assume" {
   statement {
@@ -299,9 +284,6 @@ resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
 }
 
-# =====================
-# EKS cluster
-# =====================
 resource "aws_eks_cluster" "this" {
   name     = var.cluster_name
   role_arn = aws_iam_role.eks_cluster.arn
@@ -321,16 +303,7 @@ resource "aws_eks_cluster" "this" {
   depends_on = [aws_iam_role_policy_attachment.eks_cluster_policy]
 }
 
-resource "aws_security_group_rule" "cluster_sg_self" {
-  type                     = "ingress"
-  from_port                = 0
-  to_port                  = 65535
-  protocol                 = "-1"
-  security_group_id        = aws_eks_cluster.this.vpc_config[0].cluster_security_group_id
-  source_security_group_id = aws_eks_cluster.this.vpc_config[0].cluster_security_group_id
-  description              = "Allow node-to-node and node-to-control-plane"
-}
-
+# OIDC provider for IRSA
 data "tls_certificate" "oidc" {
   url = aws_eks_cluster.this.identity[0].oidc[0].issuer
 }
@@ -339,10 +312,14 @@ resource "aws_iam_openid_connect_provider" "this" {
   url             = aws_eks_cluster.this.identity[0].oidc[0].issuer
   client_id_list  = ["sts.amazonaws.com"]
   thumbprint_list = [data.tls_certificate.oidc.certificates[0].sha1_fingerprint]
+
+  lifecycle {
+    ignore_changes = [thumbprint_list]
+  }
 }
 
 # =====================
-# Node group IAM role
+# Node group IAM role + node group
 # =====================
 data "aws_iam_policy_document" "node_assume" {
   statement {
@@ -379,9 +356,6 @@ resource "aws_iam_role_policy_attachment" "node_elb" {
   policy_arn = "arn:aws:iam::aws:policy/ElasticLoadBalancingFullAccess"
 }
 
-# =====================
-# Managed node group
-# =====================
 resource "aws_eks_node_group" "backend" {
   cluster_name    = aws_eks_cluster.this.name
   node_group_name = "backend-nodes"
@@ -389,8 +363,6 @@ resource "aws_eks_node_group" "backend" {
   subnet_ids      = [aws_subnet.public_a.id, aws_subnet.public_b.id]
   instance_types  = [var.node_instance_type]
   ami_type        = "AL2023_x86_64_STANDARD"
-  capacity_type   = "ON_DEMAND"
-  disk_size       = 20
 
   scaling_config {
     desired_size = var.node_desired
@@ -398,14 +370,7 @@ resource "aws_eks_node_group" "backend" {
     max_size     = var.node_max
   }
 
-  update_config {
-    max_unavailable = 1
-  }
-
   depends_on = [
-    aws_route_table_association.a,
-    aws_route_table_association.b,
-    aws_security_group_rule.cluster_sg_self,
     aws_iam_role_policy_attachment.node_worker,
     aws_iam_role_policy_attachment.node_cni,
     aws_iam_role_policy_attachment.node_ecr,
@@ -414,7 +379,7 @@ resource "aws_eks_node_group" "backend" {
 }
 
 # =====================
-# Core add-ons
+# Core EKS add-ons
 # =====================
 resource "aws_eks_addon" "vpc_cni" {
   cluster_name = aws_eks_cluster.this.name
@@ -435,7 +400,7 @@ resource "aws_eks_addon" "kube_proxy" {
 }
 
 # =====================
-# AWS Load Balancer Controller
+# AWS Load Balancer Controller (IAM + Helm)
 # =====================
 data "http" "alb_iam_policy" {
   url = "https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json"
@@ -479,6 +444,7 @@ resource "aws_iam_role_policy_attachment" "alb_controller" {
   role       = aws_iam_role.alb_controller.name
   policy_arn = aws_iam_policy.alb_controller.arn
 }
+
 resource "kubernetes_service_account" "alb_controller" {
   metadata {
     name      = "aws-load-balancer-controller"
@@ -496,6 +462,7 @@ resource "helm_release" "alb_controller" {
   chart      = "aws-load-balancer-controller"
   namespace  = "kube-system"
   wait       = true
+  timeout    = 600
 
   set {
     name  = "clusterName"
@@ -527,7 +494,7 @@ resource "helm_release" "alb_controller" {
 }
 
 # =====================
-# External Secrets Operator
+# External Secrets Operator (Helm + IAM + ClusterSecretStore)
 # =====================
 resource "aws_iam_policy" "eso" {
   name = "ExternalSecretsPolicy"
@@ -588,6 +555,7 @@ resource "helm_release" "eso" {
   namespace  = kubernetes_namespace.eso.metadata[0].name
   version    = var.eso_chart_version
   wait       = true
+  timeout    = 600
 }
 
 resource "kubernetes_service_account" "eso" {
@@ -633,7 +601,7 @@ resource "kubernetes_manifest" "cluster_secret_store" {
 }
 
 # =====================
-# Backend workload
+# Backend K8s resources
 # =====================
 locals {
   backend_image = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/${var.backend_repo}:${var.image_tag}"
@@ -658,22 +626,10 @@ resource "kubernetes_manifest" "backend_external_secret" {
         creationPolicy = "Owner"
       }
       data = [
-        {
-          secretKey = "DB_USER"
-          remoteRef = { key = var.rds_secret_name, property = "username" }
-        },
-        {
-          secretKey = "DB_PASSWORD"
-          remoteRef = { key = var.rds_secret_name, property = "password" }
-        },
-        {
-          secretKey = "JWT_SECRET_KEY"
-          remoteRef = { key = var.app_secret_name, property = "JWT_SECRET_KEY" }
-        },
-        {
-          secretKey = "SECRET_KEY"
-          remoteRef = { key = var.app_secret_name, property = "SECRET_KEY" }
-        },
+        { secretKey = "DB_USER", remoteRef = { key = var.rds_secret_name, property = "username" } },
+        { secretKey = "DB_PASSWORD", remoteRef = { key = var.rds_secret_name, property = "password" } },
+        { secretKey = "JWT_SECRET_KEY", remoteRef = { key = var.app_secret_name, property = "JWT_SECRET_KEY" } },
+        { secretKey = "SECRET_KEY", remoteRef = { key = var.app_secret_name, property = "SECRET_KEY" } },
       ]
     }
   }
@@ -831,23 +787,18 @@ resource "kubernetes_ingress_v1" "backend" {
 output "vpc_id" {
   value = aws_vpc.this.id
 }
-
 output "subnet_a_id" {
   value = aws_subnet.public_a.id
 }
-
 output "subnet_b_id" {
   value = aws_subnet.public_b.id
 }
-
 output "cluster_name" {
   value = aws_eks_cluster.this.name
 }
-
 output "cluster_endpoint" {
   value = aws_eks_cluster.this.endpoint
 }
-
 output "ecr_backend_url" {
   value = aws_ecr_repository.backend.repository_url
 }
