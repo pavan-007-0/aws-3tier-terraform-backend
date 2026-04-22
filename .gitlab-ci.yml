@@ -16,7 +16,6 @@ variables:
   DOCKER_TLS_CERTDIR: ""
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
-  # Quiet warnings; collapse plan/apply output
   TF_CLI_ARGS: "-no-color"
 
 # ---------------------------------------------------------------------
@@ -24,14 +23,18 @@ variables:
 # ---------------------------------------------------------------------
 validate-terraform:
   stage: validate
-  image: { name: "hashicorp/terraform:1.9", entrypoint: [""] }
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
   script:
     - cd "$TF_DIR"
     - terraform fmt -check -recursive -diff
 
 validate-aws-credentials:
   stage: validate
-  image: { name: "amazon/aws-cli", entrypoint: [""] }
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
   script:
     - aws sts get-caller-identity
 
@@ -40,7 +43,9 @@ validate-aws-credentials:
 # ---------------------------------------------------------------------
 bootstrap-state-bucket:
   stage: bootstrap
-  image: { name: "amazon/aws-cli", entrypoint: [""] }
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
   script:
     - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
     - STATE_BUCKET="tf-state-${AWS_ACCOUNT_ID}-${AWS_DEFAULT_REGION}"
@@ -63,11 +68,13 @@ bootstrap-state-bucket:
       fi
 
 # ---------------------------------------------------------------------
-# Infrastructure (Terraform) - fully idempotent, single apply
+# Infrastructure (Terraform) - fully idempotent
 # ---------------------------------------------------------------------
 infra-apply:
   stage: infra
-  image: { name: "amazon/aws-cli", entrypoint: [""] }
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
   before_script:
     - dnf install -y unzip tar gzip jq >/dev/null
     - curl -sSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o /tmp/tf.zip
@@ -78,7 +85,7 @@ infra-apply:
     - export STATE_BUCKET="tf-state-${AWS_ACCOUNT_ID}-${AWS_DEFAULT_REGION}"
     - cd "$TF_DIR"
 
-    # ---- 0. Ensure ALB controller IAM policy JSON file is present
+    # ---- 0. Ensure ALB controller IAM policy JSON is present
     - mkdir -p policies
     - |
       if [ ! -s policies/alb-controller-policy.json ]; then
@@ -88,113 +95,111 @@ infra-apply:
           -o policies/alb-controller-policy.json
       fi
 
-    # ---- 1. Initialize backend
+    # ---- 1. PRE-CLEAN: delete any orphan IAM/OIDC resources from AWS
+    #         that exist but are not in current Terraform state.
+    #         This guarantees a clean slate even after partial deletes.
     - terraform init -reconfigure -backend-config="bucket=$STATE_BUCKET"
-
-    # ---- 2. Import any AWS resources that exist but aren't in state
-    #         (handles state-loss + AWS-orphans scenarios)
     - |
-      import_if_orphan() {
-        local addr="$1"; local exists_cmd="$2"; local import_id="$3"
-        if terraform state show "$addr" >/dev/null 2>&1; then
-          return 0
-        fi
-        if eval "$exists_cmd" >/dev/null 2>&1; then
-          echo "==> Importing orphan: $addr -> $import_id"
-          terraform import -input=false "$addr" "$import_id" || true
-        fi
+      echo "===== Pre-cleaning orphan IAM resources ====="
+
+      tf_has() {
+        terraform state show "$1" >/dev/null 2>&1
       }
 
-      # IAM policies
-      ALB_POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/AWSLoadBalancerControllerIAMPolicy"
-      ESO_POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/ExternalSecretsPolicy"
-      import_if_orphan "aws_iam_policy.alb_controller" \
-        "aws iam get-policy --policy-arn $ALB_POLICY_ARN" "$ALB_POLICY_ARN"
-      import_if_orphan "aws_iam_policy.eso" \
-        "aws iam get-policy --policy-arn $ESO_POLICY_ARN" "$ESO_POLICY_ARN"
-
-      # IAM roles
-      import_if_orphan "aws_iam_role.eks_cluster" \
-        "aws iam get-role --role-name ${CLUSTER_NAME}-cluster-role" \
-        "${CLUSTER_NAME}-cluster-role"
-      import_if_orphan "aws_iam_role.node" \
-        "aws iam get-role --role-name ${CLUSTER_NAME}-node-role" \
-        "${CLUSTER_NAME}-node-role"
-      import_if_orphan "aws_iam_role.alb_controller" \
-        "aws iam get-role --role-name AWSLoadBalancerControllerRole" \
-        "AWSLoadBalancerControllerRole"
-      import_if_orphan "aws_iam_role.eso" \
-        "aws iam get-role --role-name ExternalSecretsRole" \
-        "ExternalSecretsRole"
-
-      # IAM role policy attachments
-      import_if_orphan "aws_iam_role_policy_attachment.eks_cluster_policy" \
-        "aws iam list-attached-role-policies --role-name ${CLUSTER_NAME}-cluster-role --query 'AttachedPolicies[?PolicyArn==\`arn:aws:iam::aws:policy/AmazonEKSClusterPolicy\`]' --output text | grep -q AmazonEKSClusterPolicy" \
-        "${CLUSTER_NAME}-cluster-role/arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
-      import_if_orphan "aws_iam_role_policy_attachment.node_worker" \
-        "aws iam list-attached-role-policies --role-name ${CLUSTER_NAME}-node-role --query 'AttachedPolicies[?PolicyArn==\`arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy\`]' --output text | grep -q AmazonEKSWorkerNodePolicy" \
-        "${CLUSTER_NAME}-node-role/arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
-      import_if_orphan "aws_iam_role_policy_attachment.node_cni" \
-        "aws iam list-attached-role-policies --role-name ${CLUSTER_NAME}-node-role --query 'AttachedPolicies[?PolicyArn==\`arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy\`]' --output text | grep -q AmazonEKS_CNI_Policy" \
-        "${CLUSTER_NAME}-node-role/arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
-      import_if_orphan "aws_iam_role_policy_attachment.node_ecr" \
-        "aws iam list-attached-role-policies --role-name ${CLUSTER_NAME}-node-role --query 'AttachedPolicies[?PolicyArn==\`arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly\`]' --output text | grep -q ContainerRegistry" \
-        "${CLUSTER_NAME}-node-role/arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
-      import_if_orphan "aws_iam_role_policy_attachment.node_elb" \
-        "aws iam list-attached-role-policies --role-name ${CLUSTER_NAME}-node-role --query 'AttachedPolicies[?PolicyArn==\`arn:aws:iam::aws:policy/ElasticLoadBalancingFullAccess\`]' --output text | grep -q ElasticLoadBalancing" \
-        "${CLUSTER_NAME}-node-role/arn:aws:iam::aws:policy/ElasticLoadBalancingFullAccess"
-      import_if_orphan "aws_iam_role_policy_attachment.alb_controller" \
-        "aws iam list-attached-role-policies --role-name AWSLoadBalancerControllerRole --query 'AttachedPolicies[?PolicyArn==\`'$ALB_POLICY_ARN'\`]' --output text | grep -q LoadBalancer" \
-        "AWSLoadBalancerControllerRole/$ALB_POLICY_ARN"
-      import_if_orphan "aws_iam_role_policy_attachment.eso" \
-        "aws iam list-attached-role-policies --role-name ExternalSecretsRole --query 'AttachedPolicies[?PolicyArn==\`'$ESO_POLICY_ARN'\`]' --output text | grep -q ExternalSecrets" \
-        "ExternalSecretsRole/$ESO_POLICY_ARN"
-
-      # ECR repository
-      import_if_orphan "aws_ecr_repository.backend" \
-        "aws ecr describe-repositories --repository-names ${ECR_REPO} --region ${AWS_DEFAULT_REGION}" \
-        "${ECR_REPO}"
-
-      # OIDC provider (only if cluster exists)
-      OIDC_URL=$(aws eks describe-cluster --name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION} \
-        --query 'cluster.identity.oidc.issuer' --output text 2>/dev/null | sed 's|https://||' || echo "")
-      if [ -n "$OIDC_URL" ] && [ "$OIDC_URL" != "None" ]; then
-        OIDC_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_URL}"
-        import_if_orphan "aws_iam_openid_connect_provider.this" \
-          "aws iam get-open-id-connect-provider --open-id-connect-provider-arn $OIDC_ARN" \
-          "$OIDC_ARN"
-      fi
-
-      # EKS cluster
-      import_if_orphan "aws_eks_cluster.this" \
-        "aws eks describe-cluster --name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION}" \
-        "${CLUSTER_NAME}"
-
-      # EKS node group
-      import_if_orphan "aws_eks_node_group.backend" \
-        "aws eks describe-nodegroup --cluster-name ${CLUSTER_NAME} --nodegroup-name backend-nodes --region ${AWS_DEFAULT_REGION}" \
-        "${CLUSTER_NAME}:backend-nodes"
-
-      # EKS addons
-      for addon in vpc_cni:vpc-cni coredns:coredns kube_proxy:kube-proxy; do
-        tf_name="${addon%%:*}"; addon_name="${addon##*:}"
-        import_if_orphan "aws_eks_addon.${tf_name}" \
-          "aws eks describe-addon --cluster-name ${CLUSTER_NAME} --addon-name ${addon_name} --region ${AWS_DEFAULT_REGION}" \
-          "${CLUSTER_NAME}:${addon_name}"
+      # IAM ROLES: detach all policies, then delete (only if not in TF state)
+      for ENTRY in \
+          "aws_iam_role.eks_cluster:${CLUSTER_NAME}-cluster-role" \
+          "aws_iam_role.node:${CLUSTER_NAME}-node-role" \
+          "aws_iam_role.alb_controller:AWSLoadBalancerControllerRole" \
+          "aws_iam_role.eso:ExternalSecretsRole"; do
+        ADDR="${ENTRY%%:*}"
+        ROLE="${ENTRY##*:}"
+        if tf_has "$ADDR"; then
+          echo "  [keep]   role $ROLE (in TF state)"
+          continue
+        fi
+        if aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
+          echo "  [delete] orphan role $ROLE"
+          for P in $(aws iam list-attached-role-policies --role-name "$ROLE" \
+                       --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null); do
+            aws iam detach-role-policy --role-name "$ROLE" --policy-arn "$P" 2>/dev/null || true
+          done
+          for IP in $(aws iam list-role-policies --role-name "$ROLE" \
+                        --query 'PolicyNames[]' --output text 2>/dev/null); do
+            aws iam delete-role-policy --role-name "$ROLE" --policy-name "$IP" 2>/dev/null || true
+          done
+          for IP in $(aws iam list-instance-profiles-for-role --role-name "$ROLE" \
+                        --query 'InstanceProfiles[].InstanceProfileName' --output text 2>/dev/null); do
+            aws iam remove-role-from-instance-profile --instance-profile-name "$IP" --role-name "$ROLE" 2>/dev/null || true
+          done
+          aws iam delete-role --role-name "$ROLE" 2>/dev/null || true
+        fi
       done
 
-      # RDS security group
-      SG_ID=$(aws ec2 describe-security-groups \
-        --filters "Name=group-name,Values=ecommerce-rds-sg" \
-        --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
-      if [ "$SG_ID" != "None" ] && [ -n "$SG_ID" ]; then
-        import_if_orphan "aws_security_group.rds" "true" "$SG_ID"
+      # IAM POLICIES: delete non-default versions, then the policy
+      for ENTRY in \
+          "aws_iam_policy.alb_controller:AWSLoadBalancerControllerIAMPolicy" \
+          "aws_iam_policy.eso:ExternalSecretsPolicy"; do
+        ADDR="${ENTRY%%:*}"
+        POL="${ENTRY##*:}"
+        ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${POL}"
+        if tf_has "$ADDR"; then
+          echo "  [keep]   policy $POL (in TF state)"
+          continue
+        fi
+        if aws iam get-policy --policy-arn "$ARN" >/dev/null 2>&1; then
+          echo "  [delete] orphan policy $POL"
+          for ROLE_USING in $(aws iam list-entities-for-policy --policy-arn "$ARN" \
+                               --query 'PolicyRoles[].RoleName' --output text 2>/dev/null); do
+            aws iam detach-role-policy --role-name "$ROLE_USING" --policy-arn "$ARN" 2>/dev/null || true
+          done
+          for V in $(aws iam list-policy-versions --policy-arn "$ARN" \
+                       --query 'Versions[?!IsDefaultVersion].VersionId' --output text 2>/dev/null); do
+            aws iam delete-policy-version --policy-arn "$ARN" --version-id "$V" 2>/dev/null || true
+          done
+          aws iam delete-policy --policy-arn "$ARN" 2>/dev/null || true
+        fi
+      done
+
+      # OIDC PROVIDER: delete any that aren't tracked in TF state
+      if ! tf_has "aws_iam_openid_connect_provider.this"; then
+        for OIDC_ARN in $(aws iam list-open-id-connect-providers \
+                            --query 'OpenIDConnectProviderList[].Arn' --output text 2>/dev/null); do
+          # only delete EKS OIDC providers (oidc.eks.<region>.amazonaws.com)
+          if echo "$OIDC_ARN" | grep -q "oidc.eks.${AWS_DEFAULT_REGION}.amazonaws.com"; then
+            echo "  [delete] orphan OIDC provider $OIDC_ARN"
+            aws iam delete-open-id-connect-provider --open-id-connect-provider-arn "$OIDC_ARN" 2>/dev/null || true
+          fi
+        done
       fi
 
-    # ---- 3. Refresh state to drop entries for resources deleted in AWS
+      # ECR REPO: delete if orphan (no images preserved -- build job repushes)
+      if ! tf_has "aws_ecr_repository.backend"; then
+        if aws ecr describe-repositories --repository-names "$ECR_REPO" \
+             --region "$AWS_DEFAULT_REGION" >/dev/null 2>&1; then
+          echo "  [delete] orphan ECR repo $ECR_REPO"
+          aws ecr delete-repository --repository-name "$ECR_REPO" \
+            --region "$AWS_DEFAULT_REGION" --force >/dev/null 2>&1 || true
+        fi
+      fi
+
+      # RDS SECURITY GROUP: delete if orphan
+      if ! tf_has "aws_security_group.rds"; then
+        SG_ID=$(aws ec2 describe-security-groups \
+                  --filters "Name=group-name,Values=ecommerce-rds-sg" \
+                  --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+        if [ "$SG_ID" != "None" ] && [ -n "$SG_ID" ]; then
+          echo "  [delete] orphan RDS SG $SG_ID"
+          aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null || true
+        fi
+      fi
+
+      echo "===== Pre-clean complete ====="
+
+    # ---- 2. Refresh state to drop entries for resources deleted in AWS
     - terraform apply -refresh-only -auto-approve -compact-warnings || true
 
-    # ---- 4. Single apply (no -target, no warnings)
+    # ---- 3. Single apply (no -target, no warnings)
     - terraform apply -auto-approve -compact-warnings -var "image_tag=${IMAGE_TAG}"
 
   artifacts:
@@ -208,7 +213,9 @@ infra-apply:
 # ---------------------------------------------------------------------
 build:
   stage: build
-  image: { name: "amazon/aws-cli", entrypoint: [""] }
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
   services:
     - docker:24-dind
   before_script:
@@ -227,7 +234,9 @@ build:
 # ---------------------------------------------------------------------
 deploy:
   stage: deploy
-  image: { name: "amazon/aws-cli", entrypoint: [""] }
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
   before_script:
     - curl -sLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.32.0/bin/linux/amd64/kubectl"
     - chmod +x /usr/local/bin/kubectl
