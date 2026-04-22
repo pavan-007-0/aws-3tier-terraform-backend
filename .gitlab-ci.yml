@@ -11,6 +11,8 @@ variables:
   TF_DIR: "."
   ECR_REPO: "backend-repo"
   IMAGE_TAG: "latest"
+  DOCKER_HOST: "tcp://docker:2375"
+  DOCKER_TLS_CERTDIR: ""
 
 validate-terraform:
   stage: validate
@@ -70,8 +72,9 @@ infra-apply:
   image:
     name: amazon/aws-cli
     entrypoint: [""]
+  before_script:
+    - dnf install -y unzip tar gzip >/dev/null
   script:
-    - yum install -y unzip >/dev/null
     - curl -sSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o /tmp/tf.zip
     - unzip -o /tmp/tf.zip -d /usr/local/bin
     - terraform version
@@ -91,14 +94,17 @@ infra-apply:
 
 build:
   stage: build
-  image: docker:24
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
   services:
     - docker:24-dind
   before_script:
-    - apk add --no-cache aws-cli
+    - dnf install -y docker >/dev/null
   script:
     - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
     - export ECR_URL="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPO}"
+    - aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$AWS_DEFAULT_REGION" >/dev/null 2>&1 || aws ecr create-repository --repository-name "$ECR_REPO" --region "$AWS_DEFAULT_REGION" --image-scanning-configuration scanOnPush=true
     - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
     - docker build -t "${ECR_URL}:${IMAGE_TAG}" .
     - docker push "${ECR_URL}:${IMAGE_TAG}"
@@ -108,8 +114,6 @@ deploy:
   image:
     name: amazon/aws-cli
     entrypoint: [""]
-  before_script:
-    - yum install -y tar gzip >/dev/null
   script:
     - curl -sLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.32.0/bin/linux/amd64/kubectl"
     - chmod +x /usr/local/bin/kubectl
