@@ -6,7 +6,7 @@ stages:
   - deploy
 
 variables:
-  AWS_DEFAULT_REGION: "us-east-2"
+  AWS_DEFAULT_REGION: "us-east-1"
   TF_VERSION: "1.9.8"
   TF_DIR: "."
   ECR_REPO: "backend-repo"
@@ -57,7 +57,7 @@ bootstrap-state-bucket:
       if aws s3api head-bucket --bucket "$STATE_BUCKET" 2>/dev/null; then
         echo "Bucket $STATE_BUCKET already exists - skipping"
       else
-        if [ "$AWS_DEFAULT_REGION" = "us-east-2" ]; then
+        if [ "$AWS_DEFAULT_REGION" = "us-east-1" ]; then
           aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$AWS_DEFAULT_REGION"
         else
           aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$AWS_DEFAULT_REGION" --create-bucket-configuration LocationConstraint="$AWS_DEFAULT_REGION"
