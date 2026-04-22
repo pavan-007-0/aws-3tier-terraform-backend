@@ -51,82 +51,28 @@ provider "helm" {
 # =====================
 # Variables
 # =====================
-variable "aws_region" {
-  type    = string
-  default = "us-east-1"
-}
-variable "cluster_name" {
-  type    = string
-  default = "ecommerce-cluster"
-}
-variable "eks_version" {
-  type    = string
-  default = "1.32"
-}
-variable "vpc_cidr" {
-  type    = string
-  default = "10.0.0.0/16"
-}
-variable "subnet_a_cidr" {
-  type    = string
-  default = "10.0.1.0/24"
-}
-variable "subnet_b_cidr" {
-  type    = string
-  default = "10.0.2.0/24"
-}
-variable "node_instance_type" {
-  type    = string
-  default = "t3.medium"
-}
-variable "node_min" {
-  type    = number
-  default = 1
-}
-variable "node_max" {
-  type    = number
-  default = 3
-}
-variable "node_desired" {
-  type    = number
-  default = 2
-}
-variable "backend_repo" {
-  type    = string
-  default = "backend-repo"
-}
-variable "image_tag" {
-  type    = string
-  default = "latest"
-}
-variable "rds_endpoint" {
-  type    = string
-  default = "database-1.coxucmkk0rho.us-east-1.rds.amazonaws.com"
-}
-variable "rds_secret_name" {
-  type    = string
-  default = "rds!db-a31a37c1-ddb2-4685-a5c6-dbd11475e1ab"
-}
-variable "app_secret_name" {
-  type    = string
-  default = "secrets/backend/app"
-}
-variable "eso_chart_version" {
-  type    = string
-  default = "0.20.4"
-}
-variable "frontend_url" {
-  type    = string
-  default = "http://localhost:4200"
-}
+variable "aws_region"         { type = string  default = "us-east-1" }
+variable "cluster_name"       { type = string  default = "ecommerce-cluster" }
+variable "eks_version"        { type = string  default = "1.32" }
+variable "vpc_cidr"           { type = string  default = "10.0.0.0/16" }
+variable "subnet_a_cidr"      { type = string  default = "10.0.1.0/24" }
+variable "subnet_b_cidr"      { type = string  default = "10.0.2.0/24" }
+variable "node_instance_type" { type = string  default = "t3.medium" }
+variable "node_min"           { type = number  default = 1 }
+variable "node_max"           { type = number  default = 3 }
+variable "node_desired"       { type = number  default = 2 }
+variable "backend_repo"       { type = string  default = "backend-repo" }
+variable "image_tag"          { type = string  default = "latest" }
+variable "rds_endpoint"       { type = string  default = "database-1.coxucmkk0rho.us-east-1.rds.amazonaws.com" }
+variable "rds_secret_name"    { type = string  default = "rds!db-a31a37c1-ddb2-4685-a5c6-dbd11475e1ab" }
+variable "app_secret_name"    { type = string  default = "secrets/backend/app" }
+variable "eso_chart_version"  { type = string  default = "0.20.4" }
+variable "frontend_url"       { type = string  default = "http://localhost:4200" }
 
 # =====================
 # Data + locals
 # =====================
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
+data "aws_availability_zones" "available" { state = "available" }
 data "aws_caller_identity" "current" {}
 
 locals {
@@ -156,7 +102,6 @@ resource "aws_subnet" "public_a" {
   cidr_block              = var.subnet_a_cidr
   availability_zone       = data.aws_availability_zones.available.names[0]
   map_public_ip_on_launch = true
-
   tags = merge(local.common_tags, {
     Name                                        = "ecommerce-subnet-public-a"
     "kubernetes.io/role/elb"                    = "1"
@@ -169,7 +114,6 @@ resource "aws_subnet" "public_b" {
   cidr_block              = var.subnet_b_cidr
   availability_zone       = data.aws_availability_zones.available.names[1]
   map_public_ip_on_launch = true
-
   tags = merge(local.common_tags, {
     Name                                        = "ecommerce-subnet-public-b"
     "kubernetes.io/role/elb"                    = "1"
@@ -179,12 +123,10 @@ resource "aws_subnet" "public_b" {
 
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.this.id
-
   route {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.this.id
   }
-
   tags = merge(local.common_tags, { Name = "ecommerce-public-rt" })
 }
 
@@ -223,16 +165,9 @@ resource "aws_security_group_rule" "rds_from_eks" {
 resource "aws_ecr_repository" "backend" {
   name                 = var.backend_repo
   image_tag_mutability = "MUTABLE"
-
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-
-  encryption_configuration {
-    encryption_type = "AES256"
-  }
-
-  tags = local.common_tags
+  image_scanning_configuration { scan_on_push = true }
+  encryption_configuration     { encryption_type = "AES256" }
+  tags                 = local.common_tags
 }
 
 # =====================
@@ -284,7 +219,6 @@ resource "aws_eks_cluster" "this" {
   depends_on = [aws_iam_role_policy_attachment.eks_cluster_policy]
 }
 
-# OIDC provider for IRSA
 data "tls_certificate" "oidc" {
   url = aws_eks_cluster.this.identity[0].oidc[0].issuer
 }
@@ -293,10 +227,7 @@ resource "aws_iam_openid_connect_provider" "this" {
   url             = aws_eks_cluster.this.identity[0].oidc[0].issuer
   client_id_list  = ["sts.amazonaws.com"]
   thumbprint_list = [data.tls_certificate.oidc.certificates[0].sha1_fingerprint]
-
-  lifecycle {
-    ignore_changes = [thumbprint_list]
-  }
+  lifecycle { ignore_changes = [thumbprint_list] }
 }
 
 # =====================
@@ -362,26 +293,12 @@ resource "aws_eks_node_group" "backend" {
 # =====================
 # Core EKS add-ons
 # =====================
-resource "aws_eks_addon" "vpc_cni" {
-  cluster_name = aws_eks_cluster.this.name
-  addon_name   = "vpc-cni"
-  depends_on   = [aws_eks_node_group.backend]
-}
-
-resource "aws_eks_addon" "coredns" {
-  cluster_name = aws_eks_cluster.this.name
-  addon_name   = "coredns"
-  depends_on   = [aws_eks_node_group.backend]
-}
-
-resource "aws_eks_addon" "kube_proxy" {
-  cluster_name = aws_eks_cluster.this.name
-  addon_name   = "kube-proxy"
-  depends_on   = [aws_eks_node_group.backend]
-}
+resource "aws_eks_addon" "vpc_cni"    { cluster_name = aws_eks_cluster.this.name  addon_name = "vpc-cni"    depends_on = [aws_eks_node_group.backend] }
+resource "aws_eks_addon" "coredns"    { cluster_name = aws_eks_cluster.this.name  addon_name = "coredns"    depends_on = [aws_eks_node_group.backend] }
+resource "aws_eks_addon" "kube_proxy" { cluster_name = aws_eks_cluster.this.name  addon_name = "kube-proxy" depends_on = [aws_eks_node_group.backend] }
 
 # =====================
-# AWS Load Balancer Controller (IAM + Helm) - reference existing IAM policy
+# AWS Load Balancer Controller (uses existing IAM policy)
 # =====================
 data "aws_iam_policy" "alb_controller" {
   name = "AWSLoadBalancerControllerIAMPolicy"
@@ -440,26 +357,11 @@ resource "helm_release" "alb_controller" {
   wait       = true
   timeout    = 600
 
-  set {
-    name  = "clusterName"
-    value = aws_eks_cluster.this.name
-  }
-  set {
-    name  = "serviceAccount.create"
-    value = "false"
-  }
-  set {
-    name  = "serviceAccount.name"
-    value = "aws-load-balancer-controller"
-  }
-  set {
-    name  = "region"
-    value = var.aws_region
-  }
-  set {
-    name  = "vpcId"
-    value = aws_vpc.this.id
-  }
+  set { name = "clusterName"           value = aws_eks_cluster.this.name }
+  set { name = "serviceAccount.create" value = "false" }
+  set { name = "serviceAccount.name"   value = "aws-load-balancer-controller" }
+  set { name = "region"                value = var.aws_region }
+  set { name = "vpcId"                 value = aws_vpc.this.id }
 
   depends_on = [
     kubernetes_service_account.alb_controller,
@@ -470,7 +372,7 @@ resource "helm_release" "alb_controller" {
 }
 
 # =====================
-# External Secrets Operator (Helm + IAM + ClusterSecretStore) - reference existing IAM policy
+# External Secrets Operator (uses existing IAM policy)
 # =====================
 data "aws_iam_policy" "eso" {
   name = "ExternalSecretsPolicy"
@@ -507,9 +409,7 @@ resource "aws_iam_role_policy_attachment" "eso" {
 }
 
 resource "kubernetes_namespace" "eso" {
-  metadata {
-    name = "external-secrets"
-  }
+  metadata { name = "external-secrets" }
   depends_on = [aws_eks_node_group.backend]
 }
 
@@ -535,12 +435,12 @@ resource "kubernetes_service_account" "eso" {
 }
 
 resource "kubernetes_manifest" "cluster_secret_store" {
+  field_manager { force_conflicts = true }
+
   manifest = {
     apiVersion = "external-secrets.io/v1"
     kind       = "ClusterSecretStore"
-    metadata = {
-      name = "aws-secrets-manager"
-    }
+    metadata   = { name = "aws-secrets-manager" }
     spec = {
       provider = {
         aws = {
@@ -573,6 +473,8 @@ locals {
 }
 
 resource "kubernetes_manifest" "backend_external_secret" {
+  field_manager { force_conflicts = true }
+
   manifest = {
     apiVersion = "external-secrets.io/v1"
     kind       = "ExternalSecret"
@@ -581,7 +483,7 @@ resource "kubernetes_manifest" "backend_external_secret" {
       namespace = "default"
     }
     spec = {
-      refreshInterval = "1h"
+      refreshInterval = "1h0m0s"
       secretStoreRef = {
         name = "aws-secrets-manager"
         kind = "ClusterSecretStore"
@@ -591,10 +493,10 @@ resource "kubernetes_manifest" "backend_external_secret" {
         creationPolicy = "Owner"
       }
       data = [
-        { secretKey = "DB_USER", remoteRef = { key = var.rds_secret_name, property = "username" } },
-        { secretKey = "DB_PASSWORD", remoteRef = { key = var.rds_secret_name, property = "password" } },
+        { secretKey = "DB_USER",        remoteRef = { key = var.rds_secret_name, property = "username" } },
+        { secretKey = "DB_PASSWORD",    remoteRef = { key = var.rds_secret_name, property = "password" } },
         { secretKey = "JWT_SECRET_KEY", remoteRef = { key = var.app_secret_name, property = "JWT_SECRET_KEY" } },
-        { secretKey = "SECRET_KEY", remoteRef = { key = var.app_secret_name, property = "SECRET_KEY" } },
+        { secretKey = "SECRET_KEY",     remoteRef = { key = var.app_secret_name, property = "SECRET_KEY" } },
       ]
     }
   }
@@ -613,73 +515,35 @@ resource "kubernetes_deployment_v1" "backend" {
 
   spec {
     replicas = 1
-    selector {
-      match_labels = { app = "backend" }
-    }
+    selector { match_labels = { app = "backend" } }
     template {
-      metadata {
-        labels = { app = "backend" }
-      }
+      metadata { labels = { app = "backend" } }
       spec {
         container {
           name  = "backend"
           image = local.backend_image
+          port  { container_port = 5000 }
 
-          port {
-            container_port = 5000
-          }
+          env { name = "DB_HOST"      value = var.rds_endpoint }
+          env { name = "DB_NAME"      value = "ecommerce_db" }
+          env { name = "FLASK_ENV"    value = "production" }
+          env { name = "CORS_ORIGINS" value = var.frontend_url }
 
-          env {
-            name  = "DB_HOST"
-            value = var.rds_endpoint
-          }
-          env {
-            name  = "DB_NAME"
-            value = "ecommerce_db"
-          }
-          env {
-            name  = "FLASK_ENV"
-            value = "production"
-          }
-          env {
-            name  = "CORS_ORIGINS"
-            value = var.frontend_url
-          }
           env {
             name = "DB_USER"
-            value_from {
-              secret_key_ref {
-                name = "backend-secrets"
-                key  = "DB_USER"
-              }
-            }
+            value_from { secret_key_ref { name = "backend-secrets" key = "DB_USER" } }
           }
           env {
             name = "DB_PASSWORD"
-            value_from {
-              secret_key_ref {
-                name = "backend-secrets"
-                key  = "DB_PASSWORD"
-              }
-            }
+            value_from { secret_key_ref { name = "backend-secrets" key = "DB_PASSWORD" } }
           }
           env {
             name = "JWT_SECRET_KEY"
-            value_from {
-              secret_key_ref {
-                name = "backend-secrets"
-                key  = "JWT_SECRET_KEY"
-              }
-            }
+            value_from { secret_key_ref { name = "backend-secrets" key = "JWT_SECRET_KEY" } }
           }
           env {
             name = "SECRET_KEY"
-            value_from {
-              secret_key_ref {
-                name = "backend-secrets"
-                key  = "SECRET_KEY"
-              }
-            }
+            value_from { secret_key_ref { name = "backend-secrets" key = "SECRET_KEY" } }
           }
 
           resources {
@@ -735,9 +599,7 @@ resource "kubernetes_ingress_v1" "backend" {
           backend {
             service {
               name = kubernetes_service_v1.backend.metadata[0].name
-              port {
-                number = 5000
-              }
+              port { number = 5000 }
             }
           }
         }
@@ -751,24 +613,13 @@ resource "kubernetes_ingress_v1" "backend" {
 # =====================
 # Outputs
 # =====================
-output "vpc_id" {
-  value = aws_vpc.this.id
-}
-output "subnet_a_id" {
-  value = aws_subnet.public_a.id
-}
-output "subnet_b_id" {
-  value = aws_subnet.public_b.id
-}
-output "cluster_name" {
-  value = aws_eks_cluster.this.name
-}
-output "cluster_endpoint" {
-  value = aws_eks_cluster.this.endpoint
-}
-output "ecr_backend_url" {
-  value = aws_ecr_repository.backend.repository_url
-}
+output "vpc_id"           { value = aws_vpc.this.id }
+output "subnet_a_id"      { value = aws_subnet.public_a.id }
+output "subnet_b_id"      { value = aws_subnet.public_b.id }
+output "cluster_name"     { value = aws_eks_cluster.this.name }
+output "cluster_endpoint" { value = aws_eks_cluster.this.endpoint }
+output "ecr_backend_url"  { value = aws_ecr_repository.backend.repository_url }
+
 output "backend_alb_hostname" {
   value       = try(kubernetes_ingress_v1.backend.status[0].load_balancer[0].ingress[0].hostname, "")
   description = "Backend ALB DNS - takes ~3-5 min to populate after first apply"
