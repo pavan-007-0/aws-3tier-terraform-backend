@@ -12,9 +12,6 @@ variables:
   ECR_REPO: "backend-repo"
   IMAGE_TAG: "latest"
 
-# =====================
-# Stage: validate
-# =====================
 validate-terraform:
   stage: validate
   image: hashicorp/terraform:1.9
@@ -41,9 +38,6 @@ validate-python-code:
     - pip install --quiet flake8
     - flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics || true
 
-# =====================
-# Stage: bootstrap (create S3 state bucket if missing)
-# =====================
 bootstrap-state-bucket:
   stage: bootstrap
   image: amazon/aws-cli
@@ -65,9 +59,6 @@ bootstrap-state-bucket:
         echo "Bucket $STATE_BUCKET created"
       fi
 
-# =====================
-# Stage: infra (terraform apply)
-# =====================
 infra-apply:
   stage: infra
   image: amazon/aws-cli
@@ -77,33 +68,19 @@ infra-apply:
     - unzip -o /tmp/tf.zip -d /usr/local/bin
     - terraform version
     - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-    - if [ -z "$AWS_ACCOUNT_ID" ]; then echo "ERROR: failed to get AWS account ID"; exit 1; fi
+    - if [ -z "$AWS_ACCOUNT_ID" ]; then echo "ERROR failed to get AWS account ID"; exit 1; fi
     - export AWS_ACCOUNT_ID
     - export STATE_BUCKET="tf-state-${AWS_ACCOUNT_ID}-${AWS_DEFAULT_REGION}"
-    - echo "AWS account $AWS_ACCOUNT_ID  /  state bucket $STATE_BUCKET"
+    - echo "AWS account $AWS_ACCOUNT_ID state bucket $STATE_BUCKET"
     - cd "$TF_DIR"
     - terraform init -backend-config="bucket=$STATE_BUCKET"
-    # Stage 1: build cluster + addons + helm releases first (kubernetes_manifest needs the cluster live)
-    - |
-      terraform apply -auto-approve \
-        -target=aws_eks_cluster.this \
-        -target=aws_eks_node_group.backend \
-        -target=aws_eks_addon.vpc_cni \
-        -target=aws_eks_addon.coredns \
-        -target=aws_eks_addon.kube_proxy \
-        -target=helm_release.alb_controller \
-        -target=helm_release.eso \
-        -target=kubernetes_service_account.eso
-    # Stage 2: full apply (now safe to create kubernetes_manifest resources)
+    - terraform apply -auto-approve -target=aws_eks_cluster.this -target=aws_eks_node_group.backend -target=aws_eks_addon.vpc_cni -target=aws_eks_addon.coredns -target=aws_eks_addon.kube_proxy -target=helm_release.alb_controller -target=helm_release.eso -target=kubernetes_service_account.eso
     - terraform apply -auto-approve
   artifacts:
     paths:
       - $TF_DIR/.terraform.lock.hcl
     expire_in: 1 day
 
-# =====================
-# Stage: build (docker build + push to ECR)
-# =====================
 build:
   stage: build
   image: docker:24
@@ -119,9 +96,6 @@ build:
     - docker build -t "${ECR_URL}:${IMAGE_TAG}" .
     - docker push "${ECR_URL}:${IMAGE_TAG}"
 
-# =====================
-# Stage: deploy (rollout backend pods)
-# =====================
 deploy:
   stage: deploy
   image: amazon/aws-cli
