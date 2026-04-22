@@ -7,20 +7,17 @@ stages:
 
 variables:
   AWS_DEFAULT_REGION: "us-east-1"
-  TF_VERSION: "1.10.5"          # fixed: was outdated 1.9.8
+  TF_VERSION: "1.9.8"
   TF_DIR: "."
   ECR_REPO: "backend-repo"
   IMAGE_TAG: "latest"
   DOCKER_HOST: "tcp://docker:2375"
   DOCKER_TLS_CERTDIR: ""
 
-# ─────────────────────────────────────────────
-# STAGE: validate
-# ─────────────────────────────────────────────
 validate-terraform:
   stage: validate
   image:
-    name: hashicorp/terraform:1.10
+    name: hashicorp/terraform:1.9
     entrypoint: [""]
   script:
     - cd "$TF_DIR"
@@ -47,9 +44,6 @@ validate-python-code:
     - pip install --quiet flake8
     - flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics || true
 
-# ─────────────────────────────────────────────
-# STAGE: bootstrap
-# ─────────────────────────────────────────────
 bootstrap-state-bucket:
   stage: bootstrap
   image:
@@ -66,26 +60,13 @@ bootstrap-state-bucket:
         if [ "$AWS_DEFAULT_REGION" = "us-east-1" ]; then
           aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$AWS_DEFAULT_REGION"
         else
-          aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$AWS_DEFAULT_REGION" \
-            --create-bucket-configuration LocationConstraint="$AWS_DEFAULT_REGION"
+          aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$AWS_DEFAULT_REGION" --create-bucket-configuration LocationConstraint="$AWS_DEFAULT_REGION"
         fi
-        aws s3api put-bucket-versioning \
-          --bucket "$STATE_BUCKET" \
-          --versioning-configuration Status=Enabled
-        aws s3api put-bucket-encryption \
-          --bucket "$STATE_BUCKET" \
-          --server-side-encryption-configuration \
-          '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+        aws s3api put-bucket-versioning --bucket "$STATE_BUCKET" --versioning-configuration Status=Enabled
+        aws s3api put-bucket-encryption --bucket "$STATE_BUCKET" --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
         echo "Bucket $STATE_BUCKET created"
       fi
 
-# ─────────────────────────────────────────────
-# STAGE: infra
-# Key fixes:
-#   1. Pre-clean stale IAM roles so re-runs never hit EntityAlreadyExists 409
-#   2. Single `terraform apply` (no -target) so the plan is always complete
-#   3. Import existing roles into state before apply if they exist outside state
-# ─────────────────────────────────────────────
 infra-apply:
   stage: infra
   image:
@@ -93,88 +74,24 @@ infra-apply:
     entrypoint: [""]
   before_script:
     - dnf install -y unzip tar gzip >/dev/null
-    # Install Terraform
-    - curl -sSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o /tmp/tf.zip
-    - unzip -q -o /tmp/tf.zip -d /usr/local/bin
-    - terraform version
   script:
-    # ── resolve account + state bucket ──────────────────────────────────────
+    - curl -sSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o /tmp/tf.zip
+    - unzip -o /tmp/tf.zip -d /usr/local/bin
+    - terraform version
     - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-    - |
-      if [ -z "$AWS_ACCOUNT_ID" ]; then
-        echo "ERROR: failed to get AWS account ID"
-        exit 1
-      fi
+    - if [ -z "$AWS_ACCOUNT_ID" ]; then echo "ERROR failed to get AWS account ID"; exit 1; fi
     - export AWS_ACCOUNT_ID
     - export STATE_BUCKET="tf-state-${AWS_ACCOUNT_ID}-${AWS_DEFAULT_REGION}"
-    - echo "AWS account $AWS_ACCOUNT_ID  state bucket $STATE_BUCKET"
-
-    # ── terraform init ───────────────────────────────────────────────────────
+    - echo "AWS account $AWS_ACCOUNT_ID state bucket $STATE_BUCKET"
     - cd "$TF_DIR"
-    - terraform init -backend-config="bucket=$STATE_BUCKET" -reconfigure
-
-    # ── import pre-existing IAM roles so Terraform owns them ────────────────
-    # This prevents the "EntityAlreadyExists 409" error on re-runs.
-    # If the role doesn't exist in AWS the import fails silently (|| true).
-    # If the role is already in state the import is skipped gracefully.
-    - |
-      CLUSTER_ROLE="ecommerce-cluster-cluster-role"
-      NODE_ROLE="ecommerce-cluster-node-role"
-      ALB_ROLE="AWSLoadBalancerControllerRole"
-      ESO_ROLE="ExternalSecretsRole"
-
-      import_role_if_needed() {
-        local TF_ADDR="$1"
-        local ROLE_NAME="$2"
-        # Check if role exists in AWS
-        if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
-          # Check if it is already tracked in Terraform state
-          if terraform state show "$TF_ADDR" >/dev/null 2>&1; then
-            echo "Role $ROLE_NAME already in Terraform state - skipping import"
-          else
-            echo "Importing existing IAM role $ROLE_NAME into Terraform state..."
-            terraform import "$TF_ADDR" "$ROLE_NAME" || true
-          fi
-        else
-          echo "Role $ROLE_NAME does not exist in AWS - will be created by Terraform"
-        fi
-      }
-
-      import_role_if_needed "aws_iam_role.eks_cluster" "$CLUSTER_ROLE"
-      import_role_if_needed "aws_iam_role.node"        "$NODE_ROLE"
-      import_role_if_needed "aws_iam_role.alb_controller" "$ALB_ROLE"
-      import_role_if_needed "aws_iam_role.eso"         "$ESO_ROLE"
-
-    # ── also import OIDC provider if it exists outside state ───────────────
-    - |
-      CLUSTER_EXISTS=$(aws eks describe-cluster --name ecommerce-cluster \
-        --query 'cluster.name' --output text 2>/dev/null || echo "")
-      if [ -n "$CLUSTER_EXISTS" ]; then
-        OIDC_URL=$(aws eks describe-cluster --name ecommerce-cluster \
-          --query 'cluster.identity.oidc.issuer' --output text 2>/dev/null || echo "")
-        if [ -n "$OIDC_URL" ]; then
-          OIDC_HOST=$(echo "$OIDC_URL" | sed 's|https://||')
-          OIDC_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_HOST}"
-          if aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$OIDC_ARN" >/dev/null 2>&1; then
-            if ! terraform state show aws_iam_openid_connect_provider.this >/dev/null 2>&1; then
-              echo "Importing existing OIDC provider into Terraform state..."
-              terraform import aws_iam_openid_connect_provider.this "$OIDC_ARN" || true
-            fi
-          fi
-        fi
-      fi
-
-    # ── single full apply (no -target) ─────────────────────────────────────
+    - terraform init -backend-config="bucket=$STATE_BUCKET"
+    - terraform apply -auto-approve -target=aws_eks_cluster.this -target=aws_eks_node_group.backend -target=aws_eks_addon.vpc_cni -target=aws_eks_addon.coredns -target=aws_eks_addon.kube_proxy -target=helm_release.alb_controller -target=helm_release.eso -target=kubernetes_service_account.eso
     - terraform apply -auto-approve
-
   artifacts:
     paths:
       - .terraform.lock.hcl
     expire_in: 1 day
 
-# ─────────────────────────────────────────────
-# STAGE: build
-# ─────────────────────────────────────────────
 build:
   stage: build
   image:
@@ -187,24 +104,11 @@ build:
   script:
     - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
     - export ECR_URL="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPO}"
-    - |
-      aws ecr describe-repositories \
-        --repository-names "$ECR_REPO" \
-        --region "$AWS_DEFAULT_REGION" >/dev/null 2>&1 \
-      || aws ecr create-repository \
-           --repository-name "$ECR_REPO" \
-           --region "$AWS_DEFAULT_REGION" \
-           --image-scanning-configuration scanOnPush=true
-    - |
-      aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
-        | docker login --username AWS --password-stdin \
-          "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+    - aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$AWS_DEFAULT_REGION" >/dev/null 2>&1 || aws ecr create-repository --repository-name "$ECR_REPO" --region "$AWS_DEFAULT_REGION" --image-scanning-configuration scanOnPush=true
+    - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
     - docker build -t "${ECR_URL}:${IMAGE_TAG}" .
     - docker push "${ECR_URL}:${IMAGE_TAG}"
 
-# ─────────────────────────────────────────────
-# STAGE: deploy
-# ─────────────────────────────────────────────
 deploy:
   stage: deploy
   image:
@@ -216,116 +120,6 @@ deploy:
     - aws eks update-kubeconfig --region "$AWS_DEFAULT_REGION" --name ecommerce-cluster
     - kubectl rollout restart deployment/backend -n default
     - kubectl rollout status deployment/backend -n default --timeout=300s
-    - echo "Backend deployed successfully. ALB DNS:"
-    - |
-      kubectl get ingress backend -n default \
-        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || true
+    - echo "Backend deployed. ALB DNS:"
+    - kubectl get ingress backend -n default -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || true
     - echo ""
-
-# ─────────────────────────────────────────────
-# DESTROY job (manual trigger only)
-# Deletes: EKS cluster, node groups, addons, ALBs created by the controller,
-#          VPC, subnets, IGW, route tables, IAM roles, OIDC provider, ECR repo.
-# Run this from GitLab UI → Pipelines → Run Pipeline → set DESTROY=true,
-# OR trigger via API with variable DESTROY=true.
-# ─────────────────────────────────────────────
-infra-destroy:
-  stage: infra
-  image:
-    name: amazon/aws-cli
-    entrypoint: [""]
-  when: manual          # never runs automatically
-  allow_failure: false
-  before_script:
-    - dnf install -y unzip tar gzip >/dev/null
-    - curl -sSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o /tmp/tf.zip
-    - unzip -q -o /tmp/tf.zip -d /usr/local/bin
-    - terraform version
-  script:
-    - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-    - export AWS_ACCOUNT_ID
-    - export STATE_BUCKET="tf-state-${AWS_ACCOUNT_ID}-${AWS_DEFAULT_REGION}"
-    - cd "$TF_DIR"
-    - terraform init -backend-config="bucket=$STATE_BUCKET" -reconfigure
-
-    # ── Step 1: delete ALBs created by the AWS LB Controller BEFORE destroying
-    #    the VPC. If we destroy the VPC first, orphaned ALBs block subnet/IGW deletion.
-    - |
-      echo "=== Cleaning up ALBs created by the AWS Load Balancer Controller ==="
-      VPC_ID=$(aws ec2 describe-vpcs \
-        --filters "Name=tag:Name,Values=ecommerce-vpc" \
-        --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "")
-
-      if [ -n "$VPC_ID" ] && [ "$VPC_ID" != "None" ]; then
-        # Find all ALBs in this VPC (created by the ingress controller)
-        ALB_ARNS=$(aws elbv2 describe-load-balancers \
-          --query "LoadBalancers[?VpcId=='${VPC_ID}'].LoadBalancerArn" \
-          --output text 2>/dev/null || echo "")
-
-        for ARN in $ALB_ARNS; do
-          echo "Deleting ALB: $ARN"
-          # Delete listeners first
-          LISTENER_ARNS=$(aws elbv2 describe-listeners \
-            --load-balancer-arn "$ARN" \
-            --query 'Listeners[].ListenerArn' --output text 2>/dev/null || echo "")
-          for LARN in $LISTENER_ARNS; do
-            aws elbv2 delete-listener --listener-arn "$LARN" || true
-          done
-          aws elbv2 delete-load-balancer --load-balancer-arn "$ARN" || true
-        done
-
-        # Wait for ALBs to finish deleting
-        if [ -n "$ALB_ARNS" ]; then
-          echo "Waiting 30s for ALBs to fully delete..."
-          sleep 30
-        fi
-
-        # Delete target groups in the VPC
-        TG_ARNS=$(aws elbv2 describe-target-groups \
-          --query "TargetGroups[?VpcId=='${VPC_ID}'].TargetGroupArn" \
-          --output text 2>/dev/null || echo "")
-        for TG in $TG_ARNS; do
-          echo "Deleting target group: $TG"
-          aws elbv2 delete-target-group --target-group-arn "$TG" || true
-        done
-
-        # Delete security groups created by the LB controller (tagged by k8s)
-        SG_IDS=$(aws ec2 describe-security-groups \
-          --filters "Name=vpc-id,Values=${VPC_ID}" \
-                    "Name=tag-key,Values=elbv2.k8s.aws/cluster" \
-          --query 'SecurityGroups[].GroupId' --output text 2>/dev/null || echo "")
-        for SG in $SG_IDS; do
-          echo "Deleting LB controller security group: $SG"
-          aws ec2 delete-security-group --group-id "$SG" || true
-        done
-      fi
-
-    # ── Step 2: terraform destroy (handles EKS, VPC, IAM, ECR, OIDC, etc.) ──
-    - echo "=== Running terraform destroy ==="
-    - terraform destroy -auto-approve
-
-    # ── Step 3: safety net - delete any IAM roles that slipped past Terraform ──
-    - |
-      echo "=== Safety-net IAM role cleanup ==="
-      for ROLE in \
-        "ecommerce-cluster-cluster-role" \
-        "ecommerce-cluster-node-role" \
-        "AWSLoadBalancerControllerRole" \
-        "ExternalSecretsRole"; do
-
-        if aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
-          echo "Detaching policies from $ROLE..."
-          POLICIES=$(aws iam list-attached-role-policies \
-            --role-name "$ROLE" \
-            --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null || echo "")
-          for P in $POLICIES; do
-            aws iam detach-role-policy --role-name "$ROLE" --policy-arn "$P" || true
-          done
-          echo "Deleting role $ROLE..."
-          aws iam delete-role --role-name "$ROLE" || true
-        fi
-      done
-
-    - echo "=== Destroy complete. All resources removed. ==="
-  rules:
-    - when: manual
