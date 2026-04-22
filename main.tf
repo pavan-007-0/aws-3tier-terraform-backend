@@ -131,6 +131,11 @@ variable "eso_chart_version" {
   default = "0.20.4"
 }
 
+variable "alb_chart_version" {
+  type    = string
+  default = "1.8.1"
+}
+
 variable "frontend_url" {
   type    = string
   default = "http://localhost:4200"
@@ -222,6 +227,10 @@ resource "aws_security_group" "rds" {
   description = "RDS access from EKS"
   vpc_id      = aws_vpc.this.id
   tags        = merge(local.common_tags, { Name = "ecommerce-rds-sg" })
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_security_group_rule" "rds_from_eks" {
@@ -252,7 +261,7 @@ resource "aws_ecr_repository" "backend" {
 }
 
 # =====================
-# Secrets Manager (app secret) - reference existing
+# Secrets Manager (existing)
 # =====================
 data "aws_secretsmanager_secret" "app" {
   name = var.app_secret_name
@@ -274,6 +283,10 @@ data "aws_iam_policy_document" "eks_assume" {
 resource "aws_iam_role" "eks_cluster" {
   name               = "${var.cluster_name}-cluster-role"
   assume_role_policy = data.aws_iam_policy_document.eks_assume.json
+
+  lifecycle {
+    ignore_changes = [assume_role_policy]
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
@@ -330,6 +343,10 @@ data "aws_iam_policy_document" "node_assume" {
 resource "aws_iam_role" "node" {
   name               = "${var.cluster_name}-node-role"
   assume_role_policy = data.aws_iam_policy_document.node_assume.json
+
+  lifecycle {
+    ignore_changes = [assume_role_policy]
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "node_worker" {
@@ -378,28 +395,40 @@ resource "aws_eks_node_group" "backend" {
 # Core EKS add-ons
 # =====================
 resource "aws_eks_addon" "vpc_cni" {
-  cluster_name = aws_eks_cluster.this.name
-  addon_name   = "vpc-cni"
-  depends_on   = [aws_eks_node_group.backend]
+  cluster_name                = aws_eks_cluster.this.name
+  addon_name                  = "vpc-cni"
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+  depends_on                  = [aws_eks_node_group.backend]
 }
 
 resource "aws_eks_addon" "coredns" {
-  cluster_name = aws_eks_cluster.this.name
-  addon_name   = "coredns"
-  depends_on   = [aws_eks_node_group.backend]
+  cluster_name                = aws_eks_cluster.this.name
+  addon_name                  = "coredns"
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+  depends_on                  = [aws_eks_node_group.backend]
 }
 
 resource "aws_eks_addon" "kube_proxy" {
-  cluster_name = aws_eks_cluster.this.name
-  addon_name   = "kube-proxy"
-  depends_on   = [aws_eks_node_group.backend]
+  cluster_name                = aws_eks_cluster.this.name
+  addon_name                  = "kube-proxy"
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+  depends_on                  = [aws_eks_node_group.backend]
 }
 
 # =====================
-# AWS Load Balancer Controller (uses existing IAM policy)
+# AWS Load Balancer Controller
 # =====================
-data "aws_iam_policy" "alb_controller" {
-  name = "AWSLoadBalancerControllerIAMPolicy"
+resource "aws_iam_policy" "alb_controller" {
+  name        = "AWSLoadBalancerControllerIAMPolicy"
+  description = "Permissions for AWS Load Balancer Controller"
+  policy      = file("${path.module}/policies/alb-controller-policy.json")
+
+  lifecycle {
+    ignore_changes = [policy]
+  }
 }
 
 locals {
@@ -429,11 +458,15 @@ data "aws_iam_policy_document" "alb_controller_assume" {
 resource "aws_iam_role" "alb_controller" {
   name               = "AWSLoadBalancerControllerRole"
   assume_role_policy = data.aws_iam_policy_document.alb_controller_assume.json
+
+  lifecycle {
+    ignore_changes = [assume_role_policy]
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "alb_controller" {
   role       = aws_iam_role.alb_controller.name
-  policy_arn = data.aws_iam_policy.alb_controller.arn
+  policy_arn = aws_iam_policy.alb_controller.arn
 }
 
 resource "kubernetes_service_account" "alb_controller" {
@@ -448,33 +481,33 @@ resource "kubernetes_service_account" "alb_controller" {
 }
 
 resource "helm_release" "alb_controller" {
-  name       = "aws-load-balancer-controller"
-  repository = "https://aws.github.io/eks-charts"
-  chart      = "aws-load-balancer-controller"
-  namespace  = "kube-system"
-  wait       = true
-  timeout    = 600
+  name            = "aws-load-balancer-controller"
+  repository      = "https://aws.github.io/eks-charts"
+  chart           = "aws-load-balancer-controller"
+  namespace       = "kube-system"
+  version         = var.alb_chart_version
+  wait            = true
+  timeout         = 600
+  replace         = true
+  force_update    = true
+  cleanup_on_fail = true
 
   set {
     name  = "clusterName"
     value = aws_eks_cluster.this.name
   }
-
   set {
     name  = "serviceAccount.create"
     value = "false"
   }
-
   set {
     name  = "serviceAccount.name"
     value = "aws-load-balancer-controller"
   }
-
   set {
     name  = "region"
     value = var.aws_region
   }
-
   set {
     name  = "vpcId"
     value = aws_vpc.this.id
@@ -489,10 +522,28 @@ resource "helm_release" "alb_controller" {
 }
 
 # =====================
-# External Secrets Operator (uses existing IAM policy)
+# External Secrets Operator
 # =====================
-data "aws_iam_policy" "eso" {
-  name = "ExternalSecretsPolicy"
+resource "aws_iam_policy" "eso" {
+  name        = "ExternalSecretsPolicy"
+  description = "Permissions for External Secrets Operator"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:ListSecretVersionIds",
+        "secretsmanager:ListSecrets",
+      ]
+      Resource = "*"
+    }]
+  })
+
+  lifecycle {
+    ignore_changes = [policy]
+  }
 }
 
 data "aws_iam_policy_document" "eso_assume" {
@@ -518,11 +569,15 @@ data "aws_iam_policy_document" "eso_assume" {
 resource "aws_iam_role" "eso" {
   name               = "ExternalSecretsRole"
   assume_role_policy = data.aws_iam_policy_document.eso_assume.json
+
+  lifecycle {
+    ignore_changes = [assume_role_policy]
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "eso" {
   role       = aws_iam_role.eso.name
-  policy_arn = data.aws_iam_policy.eso.arn
+  policy_arn = aws_iam_policy.eso.arn
 }
 
 resource "kubernetes_namespace" "eso" {
@@ -533,13 +588,16 @@ resource "kubernetes_namespace" "eso" {
 }
 
 resource "helm_release" "eso" {
-  name       = "external-secrets"
-  repository = "https://charts.external-secrets.io"
-  chart      = "external-secrets"
-  namespace  = kubernetes_namespace.eso.metadata[0].name
-  version    = var.eso_chart_version
-  wait       = true
-  timeout    = 600
+  name            = "external-secrets"
+  repository      = "https://charts.external-secrets.io"
+  chart           = "external-secrets"
+  namespace       = kubernetes_namespace.eso.metadata[0].name
+  version         = var.eso_chart_version
+  wait            = true
+  timeout         = 600
+  replace         = true
+  force_update    = true
+  cleanup_on_fail = true
 }
 
 resource "kubernetes_service_account" "eso" {
@@ -553,34 +611,75 @@ resource "kubernetes_service_account" "eso" {
   depends_on = [helm_release.eso]
 }
 
-resource "kubernetes_manifest" "cluster_secret_store" {
-  field_manager {
-    force_conflicts = true
-  }
+# =====================
+# CRD-dependent manifests, applied via raw helm chart
+# (avoids the kubernetes_manifest plan-time CRD lookup that
+# would otherwise force a -target two-phase apply)
+# =====================
+resource "helm_release" "platform_manifests" {
+  name            = "platform-manifests"
+  repository      = "https://charts.itscontained.io"
+  chart           = "raw"
+  version         = "0.2.5"
+  namespace       = "default"
+  wait            = true
+  timeout         = 300
+  replace         = true
+  force_update    = true
+  cleanup_on_fail = true
 
-  manifest = {
-    apiVersion = "external-secrets.io/v1"
-    kind       = "ClusterSecretStore"
-    metadata = {
-      name = "aws-secrets-manager"
-    }
-    spec = {
-      provider = {
-        aws = {
-          service = "SecretsManager"
-          region  = var.aws_region
-          auth = {
-            jwt = {
-              serviceAccountRef = {
-                name      = "external-secrets-sa"
-                namespace = "external-secrets"
+  values = [yamlencode({
+    resources = [
+      {
+        apiVersion = "external-secrets.io/v1"
+        kind       = "ClusterSecretStore"
+        metadata = {
+          name = "aws-secrets-manager"
+        }
+        spec = {
+          provider = {
+            aws = {
+              service = "SecretsManager"
+              region  = var.aws_region
+              auth = {
+                jwt = {
+                  serviceAccountRef = {
+                    name      = "external-secrets-sa"
+                    namespace = "external-secrets"
+                  }
+                }
               }
             }
           }
         }
-      }
-    }
-  }
+      },
+      {
+        apiVersion = "external-secrets.io/v1"
+        kind       = "ExternalSecret"
+        metadata = {
+          name      = "backend-secrets"
+          namespace = "default"
+        }
+        spec = {
+          refreshInterval = "1h0m0s"
+          secretStoreRef = {
+            name = "aws-secrets-manager"
+            kind = "ClusterSecretStore"
+          }
+          target = {
+            name           = "backend-secrets"
+            creationPolicy = "Owner"
+          }
+          data = [
+            { secretKey = "DB_USER", remoteRef = { key = var.rds_secret_name, property = "username" } },
+            { secretKey = "DB_PASSWORD", remoteRef = { key = var.rds_secret_name, property = "password" } },
+            { secretKey = "JWT_SECRET_KEY", remoteRef = { key = var.app_secret_name, property = "JWT_SECRET_KEY" } },
+            { secretKey = "SECRET_KEY", remoteRef = { key = var.app_secret_name, property = "SECRET_KEY" } },
+          ]
+        }
+      },
+    ]
+  })]
 
   depends_on = [
     helm_release.eso,
@@ -593,40 +692,6 @@ resource "kubernetes_manifest" "cluster_secret_store" {
 # =====================
 locals {
   backend_image = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/${var.backend_repo}:${var.image_tag}"
-}
-
-resource "kubernetes_manifest" "backend_external_secret" {
-  field_manager {
-    force_conflicts = true
-  }
-
-  manifest = {
-    apiVersion = "external-secrets.io/v1"
-    kind       = "ExternalSecret"
-    metadata = {
-      name      = "backend-secrets"
-      namespace = "default"
-    }
-    spec = {
-      refreshInterval = "1h0m0s"
-      secretStoreRef = {
-        name = "aws-secrets-manager"
-        kind = "ClusterSecretStore"
-      }
-      target = {
-        name           = "backend-secrets"
-        creationPolicy = "Owner"
-      }
-      data = [
-        { secretKey = "DB_USER", remoteRef = { key = var.rds_secret_name, property = "username" } },
-        { secretKey = "DB_PASSWORD", remoteRef = { key = var.rds_secret_name, property = "password" } },
-        { secretKey = "JWT_SECRET_KEY", remoteRef = { key = var.app_secret_name, property = "JWT_SECRET_KEY" } },
-        { secretKey = "SECRET_KEY", remoteRef = { key = var.app_secret_name, property = "SECRET_KEY" } },
-      ]
-    }
-  }
-
-  depends_on = [kubernetes_manifest.cluster_secret_store]
 }
 
 resource "kubernetes_deployment_v1" "backend" {
@@ -720,7 +785,7 @@ resource "kubernetes_deployment_v1" "backend" {
     }
   }
 
-  depends_on = [kubernetes_manifest.backend_external_secret]
+  depends_on = [helm_release.platform_manifests]
 }
 
 resource "kubernetes_service_v1" "backend" {
@@ -744,7 +809,6 @@ resource "kubernetes_ingress_v1" "backend" {
     name      = "backend"
     namespace = "default"
     annotations = {
-      "kubernetes.io/ingress.class"                = "alb"
       "alb.ingress.kubernetes.io/scheme"           = "internet-facing"
       "alb.ingress.kubernetes.io/target-type"      = "ip"
       "alb.ingress.kubernetes.io/subnets"          = "${aws_subnet.public_a.id},${aws_subnet.public_b.id}"
@@ -754,6 +818,7 @@ resource "kubernetes_ingress_v1" "backend" {
   }
 
   spec {
+    ingress_class_name = "alb"
     rule {
       http {
         path {
