@@ -418,6 +418,24 @@ resource "aws_eks_addon" "kube_proxy" {
   depends_on                  = [aws_eks_node_group.backend]
 }
 
+# Container Insights - publishes pod CPU / memory / network metrics
+# to CloudWatch under the ContainerInsights namespace.
+resource "aws_iam_role_policy_attachment" "node_cw_agent" {
+  role       = aws_iam_role.node.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+resource "aws_eks_addon" "cw_observability" {
+  cluster_name                = aws_eks_cluster.this.name
+  addon_name                  = "amazon-cloudwatch-observability"
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+  depends_on = [
+    aws_eks_node_group.backend,
+    aws_iam_role_policy_attachment.node_cw_agent,
+  ]
+}
+
 # =====================
 # AWS Load Balancer Controller
 # =====================
@@ -870,4 +888,85 @@ output "ecr_backend_url" {
 output "backend_alb_hostname" {
   value       = try(kubernetes_ingress_v1.backend.status[0].load_balancer[0].ingress[0].hostname, "")
   description = "Backend ALB DNS - takes ~3-5 min to populate after first apply"
+}
+
+# =====================
+# CloudWatch dashboard - backend
+# =====================
+data "aws_lb" "backend" {
+  tags = {
+    "ingress.k8s.aws/stack" = "default/backend"
+  }
+  depends_on = [kubernetes_ingress_v1.backend]
+}
+
+resource "aws_cloudwatch_dashboard" "backend" {
+  dashboard_name = "ecommerce-backend"
+  dashboard_body = jsonencode({
+    widgets = [
+      {
+        type   = "metric"
+        x      = 0, y = 0, width = 12, height = 6
+        properties = {
+          title  = "Backend ALB - request count & 5xx",
+          region = var.aws_region
+          view   = "timeSeries"
+          stat   = "Sum"
+          period = 60
+          metrics = [
+            ["AWS/ApplicationELB", "RequestCount",            "LoadBalancer", data.aws_lb.backend.arn_suffix],
+            [".",                  "HTTPCode_Target_5XX_Count", ".",          "."],
+            [".",                  "HTTPCode_ELB_5XX_Count",    ".",          "."]
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12, y = 0, width = 12, height = 6
+        properties = {
+          title  = "Backend ALB - response time & healthy hosts"
+          region = var.aws_region
+          view   = "timeSeries"
+          period = 60
+          metrics = [
+            ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", data.aws_lb.backend.arn_suffix, { stat = "Average" }],
+            ["AWS/ApplicationELB", "HealthyHostCount",   "LoadBalancer", data.aws_lb.backend.arn_suffix, { stat = "Average" }],
+            ["AWS/ApplicationELB", "UnHealthyHostCount", "LoadBalancer", data.aws_lb.backend.arn_suffix, { stat = "Average" }]
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0, y = 6, width = 12, height = 6
+        properties = {
+          title  = "Backend pods - CPU utilization (%)"
+          region = var.aws_region
+          view   = "timeSeries"
+          stat   = "Average"
+          period = 60
+          metrics = [
+            ["ContainerInsights", "pod_cpu_utilization", "ClusterName", aws_eks_cluster.this.name, "Namespace", "default", "Service", "backend"]
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12, y = 6, width = 12, height = 6
+        properties = {
+          title  = "Backend pods - memory utilization (%)"
+          region = var.aws_region
+          view   = "timeSeries"
+          stat   = "Average"
+          period = 60
+          metrics = [
+            ["ContainerInsights", "pod_memory_utilization", "ClusterName", aws_eks_cluster.this.name, "Namespace", "default", "Service", "backend"]
+          ]
+        }
+      }
+    ]
+  })
+}
+
+output "backend_dashboard_url" {
+  value = "https://${var.aws_region}.console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#dashboards:name=ecommerce-backend"
 }
