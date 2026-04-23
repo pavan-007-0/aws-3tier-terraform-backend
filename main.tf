@@ -618,9 +618,9 @@ resource "kubernetes_service_account" "eso" {
 # =====================
 resource "helm_release" "platform_manifests" {
   name            = "platform-manifests"
-  repository      = "https://charts.itscontained.io"
+  repository      = "https://bedag.github.io/helm-charts/"
   chart           = "raw"
-  version         = "0.2.5"
+  version         = "2.0.0"
   namespace       = "default"
   wait            = true
   timeout         = 300
