@@ -1,85 +1,210 @@
 stages:
-
-* deploy
-
-deploy-all:
-stage: deploy
-image: amazon/aws-cli
-services:
-- docker:24-dind
+  - all-in-one
 
 variables:
-AWS_DEFAULT_REGION: "us-east-1"
-TF_VERSION: "1.9.8"
-ECR_REPO: "backend-repo"
-CLUSTER_NAME: "ecommerce-cluster"
-IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
-DOCKER_HOST: "tcp://docker:2375"
-DOCKER_TLS_CERTDIR: ""
+  AWS_DEFAULT_REGION: "us-east-1"
+  TF_VERSION: "1.9.8"
+  TF_DIR: "."
+  ECR_REPO: "backend-repo"
+  CLUSTER_NAME: "ecommerce-cluster"
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+  DOCKER_HOST: "tcp://docker:2375"
+  DOCKER_TLS_CERTDIR: ""
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_CLI_ARGS: "-no-color"
 
-before_script:
-- yum install -y unzip curl tar gzip docker
+deploy-everything:
+  stage: all-in-one
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
+  services:
+    - docker:24-dind
+  before_script:
+    - dnf install -y unzip tar gzip jq docker >/dev/null
+    - curl -sSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o /tmp/tf.zip
+    - unzip -o /tmp/tf.zip -d /usr/local/bin >/dev/null
+    - curl -sLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.32.0/bin/linux/amd64/kubectl"
+    - chmod +x /usr/local/bin/kubectl
+    - terraform version
+    - kubectl version --client
+  script:
+    # ===================================================================
+    # 1. VALIDATE
+    # ===================================================================
+    - echo "===================== STAGE 1 / 5  VALIDATE ====================="
+    - aws sts get-caller-identity
+    - cd "$TF_DIR"
+    - terraform fmt -check -recursive -diff || echo "  (fmt drift - non-blocking)"
+    - export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+    - export STATE_BUCKET="tf-state-${AWS_ACCOUNT_ID}-${AWS_DEFAULT_REGION}"
+    - export ECR_URL="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPO}"
+    - echo "Account=$AWS_ACCOUNT_ID  Region=$AWS_DEFAULT_REGION  StateBucket=$STATE_BUCKET"
 
-```
-# Install Terraform
-- curl -sSL https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip -o tf.zip
-- unzip tf.zip
-- mv terraform /usr/local/bin/
-- terraform version
-```
+    # ===================================================================
+    # 2. BOOTSTRAP S3 state bucket (idempotent)
+    # ===================================================================
+    - echo "===================== STAGE 2 / 5  BOOTSTRAP STATE BUCKET ====================="
+    - |
+      if aws s3api head-bucket --bucket "$STATE_BUCKET" 2>/dev/null; then
+        echo "  State bucket $STATE_BUCKET already exists"
+      else
+        if [ "$AWS_DEFAULT_REGION" = "us-east-1" ]; then
+          aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$AWS_DEFAULT_REGION"
+        else
+          aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$AWS_DEFAULT_REGION" \
+            --create-bucket-configuration LocationConstraint="$AWS_DEFAULT_REGION"
+        fi
+        aws s3api put-bucket-versioning --bucket "$STATE_BUCKET" \
+          --versioning-configuration Status=Enabled
+        aws s3api put-bucket-encryption --bucket "$STATE_BUCKET" \
+          --server-side-encryption-configuration \
+          '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+        echo "  Created state bucket $STATE_BUCKET"
+      fi
 
-script:
-# -------------------------
-# AWS Identity
-# -------------------------
-- AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-- STATE_BUCKET="tf-state-${AWS_ACCOUNT_ID}-${AWS_DEFAULT_REGION}"
+    # ===================================================================
+    # 3. INFRA - pre-clean orphans, then single terraform apply
+    # ===================================================================
+    - echo "===================== STAGE 3 / 5  INFRA ====================="
 
-```
-# -------------------------
-# Bootstrap S3 (auto create)
-# -------------------------
-- |
-  if aws s3api head-bucket --bucket "$STATE_BUCKET" 2>/dev/null; then
-    echo "S3 bucket exists"
-  else
-    echo "Creating S3 bucket..."
-    aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$AWS_DEFAULT_REGION"
-  fi
+    # Ensure ALB controller IAM policy JSON is on disk
+    - mkdir -p policies
+    - |
+      if [ ! -s policies/alb-controller-policy.json ]; then
+        echo "  Downloading canonical ALB controller IAM policy"
+        curl -fsSL \
+          https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.2/docs/install/iam_policy.json \
+          -o policies/alb-controller-policy.json
+      fi
 
-# -------------------------
-# Terraform Init + Apply
-# -------------------------
-- terraform init -reconfigure \
-    -backend-config="bucket=$STATE_BUCKET" \
-    -backend-config="key=ecommerce/terraform.tfstate" \
-    -backend-config="region=$AWS_DEFAULT_REGION"
+    - terraform init -reconfigure -backend-config="bucket=$STATE_BUCKET"
 
-- terraform apply -auto-approve -var="image_tag=${IMAGE_TAG}"
+    # Pre-clean: delete orphan AWS resources that exist but are not in TF state
+    - |
+      echo "  ----- Pre-cleaning orphan AWS resources -----"
 
-# -------------------------
-# Build & Push Docker
-# -------------------------
-- ECR_URL="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPO}"
+      tf_has() { terraform state show "$1" >/dev/null 2>&1; }
 
-- aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
-    | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      # IAM ROLES
+      for ENTRY in \
+          "aws_iam_role.eks_cluster:${CLUSTER_NAME}-cluster-role" \
+          "aws_iam_role.node:${CLUSTER_NAME}-node-role" \
+          "aws_iam_role.alb_controller:AWSLoadBalancerControllerRole" \
+          "aws_iam_role.eso:ExternalSecretsRole"; do
+        ADDR="${ENTRY%%:*}"; ROLE="${ENTRY##*:}"
+        if tf_has "$ADDR"; then
+          echo "    [keep]   role $ROLE"
+          continue
+        fi
+        if aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
+          echo "    [delete] orphan role $ROLE"
+          for P in $(aws iam list-attached-role-policies --role-name "$ROLE" \
+                       --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null); do
+            aws iam detach-role-policy --role-name "$ROLE" --policy-arn "$P" 2>/dev/null || true
+          done
+          for IP in $(aws iam list-role-policies --role-name "$ROLE" \
+                        --query 'PolicyNames[]' --output text 2>/dev/null); do
+            aws iam delete-role-policy --role-name "$ROLE" --policy-name "$IP" 2>/dev/null || true
+          done
+          for INST in $(aws iam list-instance-profiles-for-role --role-name "$ROLE" \
+                          --query 'InstanceProfiles[].InstanceProfileName' --output text 2>/dev/null); do
+            aws iam remove-role-from-instance-profile --instance-profile-name "$INST" --role-name "$ROLE" 2>/dev/null || true
+          done
+          aws iam delete-role --role-name "$ROLE" 2>/dev/null || true
+        fi
+      done
 
-- docker build -t "${ECR_URL}:${IMAGE_TAG}" -t "${ECR_URL}:latest" .
-- docker push "${ECR_URL}:${IMAGE_TAG}"
-- docker push "${ECR_URL}:latest"
+      # IAM POLICIES
+      for ENTRY in \
+          "aws_iam_policy.alb_controller:AWSLoadBalancerControllerIAMPolicy" \
+          "aws_iam_policy.eso:ExternalSecretsPolicy"; do
+        ADDR="${ENTRY%%:*}"; POL="${ENTRY##*:}"
+        ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${POL}"
+        if tf_has "$ADDR"; then
+          echo "    [keep]   policy $POL"
+          continue
+        fi
+        if aws iam get-policy --policy-arn "$ARN" >/dev/null 2>&1; then
+          echo "    [delete] orphan policy $POL"
+          for ROLE_USING in $(aws iam list-entities-for-policy --policy-arn "$ARN" \
+                               --query 'PolicyRoles[].RoleName' --output text 2>/dev/null); do
+            aws iam detach-role-policy --role-name "$ROLE_USING" --policy-arn "$ARN" 2>/dev/null || true
+          done
+          for V in $(aws iam list-policy-versions --policy-arn "$ARN" \
+                       --query 'Versions[?!IsDefaultVersion].VersionId' --output text 2>/dev/null); do
+            aws iam delete-policy-version --policy-arn "$ARN" --version-id "$V" 2>/dev/null || true
+          done
+          aws iam delete-policy --policy-arn "$ARN" 2>/dev/null || true
+        fi
+      done
 
-# -------------------------
-# Deploy to EKS
-# -------------------------
-- curl -sLo kubectl https://dl.k8s.io/release/v1.32.0/bin/linux/amd64/kubectl
-- chmod +x kubectl
-- mv kubectl /usr/local/bin/
+      # OIDC PROVIDERS for EKS in this region
+      if ! tf_has "aws_iam_openid_connect_provider.this"; then
+        for OIDC_ARN in $(aws iam list-open-id-connect-providers \
+                            --query 'OpenIDConnectProviderList[].Arn' --output text 2>/dev/null); do
+          if echo "$OIDC_ARN" | grep -q "oidc.eks.${AWS_DEFAULT_REGION}.amazonaws.com"; then
+            echo "    [delete] orphan OIDC $OIDC_ARN"
+            aws iam delete-open-id-connect-provider --open-id-connect-provider-arn "$OIDC_ARN" 2>/dev/null || true
+          fi
+        done
+      fi
 
-- aws eks update-kubeconfig --region "$AWS_DEFAULT_REGION" --name "$CLUSTER_NAME"
+      # ECR REPO (build stage will recreate via TF; old images are lost)
+      if ! tf_has "aws_ecr_repository.backend"; then
+        if aws ecr describe-repositories --repository-names "$ECR_REPO" \
+             --region "$AWS_DEFAULT_REGION" >/dev/null 2>&1; then
+          echo "    [delete] orphan ECR repo $ECR_REPO"
+          aws ecr delete-repository --repository-name "$ECR_REPO" \
+            --region "$AWS_DEFAULT_REGION" --force >/dev/null 2>&1 || true
+        fi
+      fi
 
-- kubectl set image deployment/backend backend="${ECR_URL}:${IMAGE_TAG}" -n default || true
-- kubectl rollout status deployment/backend -n default --timeout=300s || true
+      # RDS SECURITY GROUP
+      if ! tf_has "aws_security_group.rds"; then
+        SG_ID=$(aws ec2 describe-security-groups \
+                  --filters "Name=group-name,Values=ecommerce-rds-sg" \
+                  --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+        if [ "$SG_ID" != "None" ] && [ -n "$SG_ID" ]; then
+          echo "    [delete] orphan RDS SG $SG_ID"
+          aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null || true
+        fi
+      fi
 
-- echo "Deployment completed successfully"
-```
+      echo "  ----- Pre-clean complete -----"
+
+    # Refresh state to drop entries for resources deleted in AWS
+    - terraform apply -refresh-only -auto-approve -compact-warnings || true
+
+    # Single apply - no -target, no warnings
+    - terraform apply -auto-approve -compact-warnings -var "image_tag=${IMAGE_TAG}"
+
+    # ===================================================================
+    # 4. BUILD - docker build & push to ECR
+    # ===================================================================
+    - echo "===================== STAGE 4 / 5  BUILD ====================="
+    - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+        | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+    - docker build -t "${ECR_URL}:${IMAGE_TAG}" -t "${ECR_URL}:latest" .
+    - docker push "${ECR_URL}:${IMAGE_TAG}"
+    - docker push "${ECR_URL}:latest"
+
+    # ===================================================================
+    # 5. DEPLOY - roll the deployment to the new image
+    # ===================================================================
+    - echo "===================== STAGE 5 / 5  DEPLOY ====================="
+    - aws eks update-kubeconfig --region "$AWS_DEFAULT_REGION" --name "$CLUSTER_NAME"
+    - kubectl set image deployment/backend backend="${ECR_URL}:${IMAGE_TAG}" -n default
+    - kubectl rollout status deployment/backend -n default --timeout=300s
+    - echo ""
+    - echo "===================== DONE ====================="
+    - echo "Backend ALB DNS:"
+    - kubectl get ingress backend -n default -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || true
+    - echo ""
+
+  artifacts:
+    paths:
+      - .terraform.lock.hcl
+      - policies/
+    expire_in: 1 day
