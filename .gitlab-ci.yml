@@ -184,8 +184,7 @@ deploy-everything:
     # 4. BUILD - docker build & push to ECR
     # ===================================================================
     - echo "===================== STAGE 4 / 5  BUILD ====================="
-    - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
-        | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+    - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
     - docker build -t "${ECR_URL}:${IMAGE_TAG}" -t "${ECR_URL}:latest" .
     - docker push "${ECR_URL}:${IMAGE_TAG}"
     - docker push "${ECR_URL}:latest"
