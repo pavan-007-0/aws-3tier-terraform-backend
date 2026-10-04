@@ -118,7 +118,7 @@ def login():
         
         access_token = jwt.encode(
             access_token_payload,
-            os.getenv('JWT_SECRET_KEY', 'fallback-jwt-secret'),
+            os.getenv('JWT_SECRET_KEY'),
             algorithm="HS256"
         )
 
@@ -133,7 +133,7 @@ def login():
         
         refresh_token = jwt.encode(
             refresh_token_payload,
-            os.getenv('JWT_SECRET_KEY', 'fallback-jwt-secret'),
+            os.getenv('JWT_SECRET_KEY'),
             algorithm="HS256"
         )
 
@@ -182,7 +182,7 @@ def refresh_token():
         # Decode refresh token
         payload = jwt.decode(
             refresh_token,
-            os.getenv('JWT_SECRET_KEY', 'fallback-jwt-secret'),
+            os.getenv('JWT_SECRET_KEY'),
             algorithms=['HS256']
         )
         
@@ -214,7 +214,7 @@ def refresh_token():
         
         new_access_token = jwt.encode(
             access_token_payload,
-            os.getenv('JWT_SECRET_KEY', 'fallback-jwt-secret'),
+            os.getenv('JWT_SECRET_KEY'),
             algorithm="HS256"
         )
         
@@ -244,7 +244,7 @@ def logout():
             token = auth_header.split(" ")[1]
             payload = jwt.decode(
                 token,
-                os.getenv('JWT_SECRET_KEY', 'fallback-jwt-secret'),
+                os.getenv('JWT_SECRET_KEY'),
                 algorithms=['HS256']
             )
             user_id = payload.get('user_id')

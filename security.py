@@ -26,56 +26,56 @@ limiter = Limiter(
 
 class SecurityValidator:
     """Input validation and sanitization utilities"""
-    
+
     @staticmethod
     def validate_email(email):
         """Validate email format"""
         if not email or len(email) > 254:
             return False
-        
+
         pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
         return re.match(pattern, email) is not None
-    
+
     @staticmethod
     def validate_password(password):
         """Validate password strength"""
         if not password or len(password) < 8:
             return False, "Password must be at least 8 characters long"
-        
+
         if not re.search(r'[A-Z]', password):
             return False, "Password must contain at least one uppercase letter"
-        
+
         if not re.search(r'[a-z]', password):
             return False, "Password must contain at least one lowercase letter"
-        
+
         if not re.search(r'\d', password):
             return False, "Password must contain at least one number"
-        
+
         return True, "Password is valid"
-    
+
     @staticmethod
     def sanitize_input(input_string):
         """Sanitize user input to prevent XSS"""
         if not input_string:
             return ""
-        
+
         # HTML escape
         sanitized = html.escape(str(input_string))
-        
+
         # Remove potentially dangerous characters
         sanitized = re.sub(r'[<>"\']', '', sanitized)
-        
+
         return sanitized.strip()
-    
+
     @staticmethod
     def validate_phone(phone):
         """Validate phone number format"""
         if not phone:
             return True  # Phone is optional
-        
+
         # Remove all non-digit characters
         digits_only = re.sub(r'\D', '', phone)
-        
+
         # Check if it's a valid length (10-15 digits)
         return 10 <= len(digits_only) <= 15
 
@@ -84,7 +84,7 @@ def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         token = None
-        
+
         # Check for token in Authorization header
         if 'Authorization' in request.headers:
             auth_header = request.headers['Authorization']
@@ -92,24 +92,24 @@ def token_required(f):
                 token = auth_header.split(" ")[1]  # Bearer <token>
             except IndexError:
                 return jsonify({'success': False, 'message': 'Invalid token format'}), 401
-        
+
         if not token:
             return jsonify({'success': False, 'message': 'Token is missing'}), 401
-        
+
         try:
             # Decode the token
             data = jwt.decode(
-                token, 
-                os.getenv('JWT_SECRET_KEY', 'fallback-secret'), 
+                token,
+                os.getenv('JWT_SECRET_KEY'),
                 algorithms=['HS256']
             )
             current_user_id = data['user_id']
             current_user_role = data.get('role', 'customer')
-            
+
             # Add user info to request context
             request.current_user_id = current_user_id
             request.current_user_role = current_user_role
-            
+
         except jwt.ExpiredSignatureError:
             return jsonify({'success': False, 'message': 'Token has expired'}), 401
         except jwt.InvalidTokenError:
@@ -117,9 +117,9 @@ def token_required(f):
         except Exception as e:
             logger.error(f"Token validation error: {str(e)}")
             return jsonify({'success': False, 'message': 'Token validation failed'}), 401
-        
+
         return f(*args, **kwargs)
-    
+
     return decorated
 
 def admin_required(f):
@@ -129,9 +129,9 @@ def admin_required(f):
     def decorated(*args, **kwargs):
         if not hasattr(request, 'current_user_role') or request.current_user_role != 'admin':
             return jsonify({'success': False, 'message': 'Admin access required'}), 403
-        
+
         return f(*args, **kwargs)
-    
+
     return decorated
 
 def validate_json_input(required_fields=None, optional_fields=None):
@@ -141,36 +141,36 @@ def validate_json_input(required_fields=None, optional_fields=None):
         def decorated(*args, **kwargs):
             if not request.is_json:
                 return jsonify({'success': False, 'message': 'Content-Type must be application/json'}), 400
-            
+
             data = request.get_json()
             if not data:
                 return jsonify({'success': False, 'message': 'No JSON data provided'}), 400
-            
+
             # Check required fields
             if required_fields:
                 missing_fields = [field for field in required_fields if field not in data or not data[field]]
                 if missing_fields:
                     return jsonify({
-                        'success': False, 
+                        'success': False,
                         'message': f'Missing required fields: {", ".join(missing_fields)}'
                     }), 400
-            
+
             # Sanitize all string inputs
             sanitized_data = {}
             all_fields = (required_fields or []) + (optional_fields or [])
-            
+
             for field in all_fields:
                 if field in data:
                     if isinstance(data[field], str):
                         sanitized_data[field] = SecurityValidator.sanitize_input(data[field])
                     else:
                         sanitized_data[field] = data[field]
-            
+
             # Add sanitized data to request
             request.validated_json = sanitized_data
-            
+
             return f(*args, **kwargs)
-        
+
         return decorated
     return decorator
 
@@ -185,22 +185,22 @@ def validate_csrf_token(token, session_token):
 
 class SecurityHeaders:
     """Security headers middleware"""
-    
+
     @staticmethod
     def add_security_headers(response):
         """Add security headers to response"""
         # Prevent clickjacking
         response.headers['X-Frame-Options'] = 'DENY'
-        
+
         # Prevent MIME type sniffing
         response.headers['X-Content-Type-Options'] = 'nosniff'
-        
+
         # XSS Protection
         response.headers['X-XSS-Protection'] = '1; mode=block'
-        
+
         # Strict Transport Security (HTTPS only)
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-        
+
         # Content Security Policy
         response.headers['Content-Security-Policy'] = (
             "default-src 'self'; "
@@ -210,14 +210,14 @@ class SecurityHeaders:
             "font-src 'self' https:; "
             "connect-src 'self'"
         )
-        
+
         # Referrer Policy
         response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-        
+
         # Cache Control - prevent 10-minute default caching issue
         # Allow browser cache but validate with server
         response.headers['Cache-Control'] = 'public, max-age=300, must-revalidate'
-        
+
         return response
 
 def log_security_event(event_type, user_id=None, ip_address=None, details=None):

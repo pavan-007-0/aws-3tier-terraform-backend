@@ -26,8 +26,8 @@ from security import limiter, SecurityHeaders
 app = Flask(__name__)
 
 # ---------------- Config ----------------
-app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "fallback-secret-key")
-app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "fallback-jwt-secret")
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY")
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
 app.config["ENV"] = os.getenv("FLASK_ENV", "development")
 
 if app.config["ENV"] == "testing":

@@ -82,3 +82,16 @@ Thumbs.db
 .env.local
 .env.*.local
 config/local.py
+# Local environment and generated validation artifacts
+.env
+.env.*
+!.env.example
+*.log
+logs/
+*.coverage
+coverage/
+*.pyc
+__pycache__/
+*_output.txt
+*_results.txt
+*errors*.txt

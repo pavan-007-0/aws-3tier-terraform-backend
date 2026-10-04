@@ -113,17 +113,29 @@ variable "image_tag" {
 
 variable "rds_endpoint" {
   type    = string
-  default = "database-1.coxucmkk0rho.us-east-1.rds.amazonaws.com"
+  default = ""
+  validation {
+    condition     = trimspace(var.rds_endpoint) != ""
+    error_message = "Set rds_endpoint to the target environment's RDS endpoint."
+  }
 }
 
 variable "rds_secret_name" {
   type    = string
-  default = "rds!db-a31a37c1-ddb2-4685-a5c6-dbd11475e1ab"
+  default = ""
+  validation {
+    condition     = trimspace(var.rds_secret_name) != ""
+    error_message = "Set rds_secret_name to the target Secrets Manager secret."
+  }
 }
 
 variable "app_secret_name" {
   type    = string
-  default = "secrets/backend/app"
+  default = ""
+  validation {
+    condition     = trimspace(var.app_secret_name) != ""
+    error_message = "Set app_secret_name to the target application secret."
+  }
 }
 
 variable "eso_chart_version" {
@@ -138,7 +150,11 @@ variable "alb_chart_version" {
 
 variable "frontend_url" {
   type    = string
-  default = "http://localhost:4200"
+  default = ""
+  validation {
+    condition     = trimspace(var.frontend_url) != ""
+    error_message = "Set frontend_url to the deployed frontend origin for CORS."
+  }
 }
 
 # =====================

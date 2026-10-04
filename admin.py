@@ -5,7 +5,7 @@ import jwt
 import os
 
 admin = Blueprint("admin", __name__)
-SECRET_KEY = os.getenv("SECRET_KEY", "MY_SUPER_SECRET_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY")
 
 def admin_required(f):
     """Decorator to require admin authentication"""

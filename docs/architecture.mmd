@@ -1,0 +1,36 @@
+---
+config:
+  theme: base
+  themeVariables:
+    primaryColor: "#E8F1FF"
+    primaryTextColor: "#0F172A"
+    primaryBorderColor: "#2563EB"
+    lineColor: "#475569"
+---
+flowchart LR
+    User([Customer / Admin]) --> ALB[Application Load Balancer]
+    ALB --> Ingress[Kubernetes Ingress]
+
+    subgraph VPC[Amazon VPC]
+      subgraph EKS[Amazon EKS Cluster]
+        Ingress --> Frontend[Frontend Service]
+        Ingress --> Backend[Backend Service]
+        Frontend --> Backend
+        Backend --> Secret[External Secrets]
+        Secret --> SM[AWS Secrets Manager]
+        Backend --> RDS[(Amazon RDS / MySQL)]
+        EKSNodes[Managed Node Group]
+        Frontend -. runs on .-> EKSNodes
+        Backend -. runs on .-> EKSNodes
+      end
+      ECR[Amazon ECR]
+      ECR --> Frontend
+      ECR --> Backend
+    end
+
+    CICD[GitLab CI/CD] --> Terraform[Terraform / AWS CLI automation]
+    Terraform --> EKS
+    Terraform --> ECR
+    Terraform --> Monitor[CloudWatch / Container Insights]
+    Backend --> Monitor
+    Frontend --> Monitor
