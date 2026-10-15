@@ -1,73 +1,75 @@
-# AWS 3-Tier E-Commerce Backend Infrastructure with Terraform
+# AWS 3-Tier E-Commerce Backend on Amazon EKS with Terraform
 
-[![Terraform](https://img.shields.io/badge/Terraform-%3E%3D1.6-7B42BC?logo=terraform&logoColor=white)](https://www.terraform.io/) [![AWS](https://img.shields.io/badge/AWS-EKS%20%7C%20ECR%20%7C%20RDS%20%7C%20VPC-FF9900?logo=amazon-aws&logoColor=white)](https://aws.amazon.com/) [![Kubernetes](https://img.shields.io/badge/Kubernetes-Workloads-326CE5?logo=kubernetes&logoColor=white)](https://kubernetes.io/)
+[![Terraform](https://img.shields.io/badge/Infrastructure-Terraform%20%2F%20HCL-7B42BC?logo=terraform&logoColor=white)](https://developer.hashicorp.com/terraform)
+[![AWS](https://img.shields.io/badge/AWS-EKS%20%7C%20ECR%20%7C%20RDS%20%7C%20VPC-FF9900?logo=amazonaws&logoColor=white)](https://aws.amazon.com/)
+[![Kubernetes](https://img.shields.io/badge/Workloads-Kubernetes-326CE5?logo=kubernetes&logoColor=white)](https://kubernetes.io/)
+[![GitLab CI/CD](https://img.shields.io/badge/Delivery-GitLab%20CI%2FCD-FC6D26?logo=gitlab&logoColor=white)](https://docs.gitlab.com/ee/ci/)
 
-Terraform infrastructure for a containerized 3-tier e-commerce backend running on Amazon EKS. The project provisions the AWS foundation, configures Kubernetes integration, builds the Flask backend image, and deploys the workload through an automated CI/CD workflow.
+Terraform/HCL infrastructure for the backend tier of a containerized 3-tier e-commerce platform running on Amazon EKS.
 
-> **Portfolio project:** This repository demonstrates Infrastructure as Code, container orchestration, IAM/OIDC integration, CI/CD automation, secret delivery, and operational monitoring. Review the security and cost notes before using it in an AWS account.
+> **Authoring model:** AWS, Kubernetes, Helm, IAM/OIDC, ECR, and CloudWatch resources are declared in Terraform/HCL. The GitLab pipeline automates validation, Terraform state initialization, infrastructure reconciliation, image delivery, and Kubernetes rollout.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    User([Customer / Admin]) --> ALB[Application Load Balancer]
+    User[Internet user] --> ALB[Application Load Balancer]
     ALB --> Ingress[Kubernetes Ingress]
-    subgraph VPC[Amazon VPC]
-      subgraph EKS[Amazon EKS Cluster]
-        Ingress --> Backend[Backend Service / Deployment]
-        Backend --> RDS[(Amazon RDS / MySQL)]
-        Backend --> Secret[External Secrets]
-        Secret --> SM[AWS Secrets Manager]
-        NodeGroup[Managed Node Group] -. hosts .-> Backend
-      end
-      ECR[Amazon ECR] --> Backend
-    end
-    CICD[GitLab CI/CD] --> Terraform[Terraform]
-    Terraform --> EKS
-    Terraform --> ECR
-    Terraform --> CW[CloudWatch / Container Insights]
-    Backend --> CW
+    Ingress --> Service[Backend Service]
+    Service --> Deployment[Flask Deployment on EKS]
+    Deployment --> RDS[(Amazon RDS / MySQL)]
+    Deployment --> Secrets[AWS Secrets Manager via External Secrets]
+    Deployment --> ECR[Amazon ECR image]
+    EKS[Amazon EKS managed node group] --- Deployment
+    VPC[VPC and public subnets across AZs] --- EKS
+    EKS --> CW[CloudWatch observability]
 ```
 
-Source: [`docs/architecture.mmd`](docs/architecture.mmd).
+## What is authored in HCL
 
-## What this project demonstrates
+- VPC, Internet Gateway, subnets, routes, and security groups
+- Amazon EKS cluster and managed node group
+- ECR repository and image settings
+- IAM roles, policy attachments, and EKS OIDC provider
+- AWS Load Balancer Controller and External Secrets Operator integration
+- Kubernetes namespace, Deployment, Service, and Ingress resources
+- Helm releases and EKS add-ons
+- RDS network access integration
+- CloudWatch observability add-on and dashboard
+- S3 remote Terraform state configuration
 
-- Terraform provisioning across AWS, Kubernetes, Helm, and TLS providers.
-- VPC networking, EKS cluster and managed node group, ECR, IAM roles, OIDC, and security groups.
-- AWS Load Balancer Controller and External Secrets integration.
-- Dockerized Flask application delivery with Gunicorn.
-- GitLab CI/CD from Terraform state bootstrap through image build and Kubernetes rollout.
-- CloudWatch Container Insights and dashboard integration.
+## Repository structure
 
-## Configuration
-
-Copy `.env.example` to `.env` for local development. For deployment, provide Terraform variables through a private `.tfvars` file or protected CI/CD variables. Required deployment values include `aws_region`, `cluster_name`, `rds_endpoint`, `rds_secret_name`, `app_secret_name`, `frontend_url`, `backend_repo`, and `image_tag`.
-
-Secrets must be stored in AWS Secrets Manager or a protected CI/CD secret store. Never commit `.env`, AWS keys, passwords, JWT secrets, or Terraform state.
-
-## Deployment workflow
-
-```bash
-terraform init -backend-config="bucket=<versioned-state-bucket>" -backend-config="region=<aws-region>"
-terraform fmt -check -recursive
-terraform validate
-terraform plan -var-file="<private-environment>.tfvars"
-terraform apply -var-file="<private-environment>.tfvars"
+```text
+main.tf              # Terraform/HCL providers, variables, AWS and Kubernetes resources
+Dockerfile            # Flask backend container image
+requirements.txt      # Python dependencies
+*.py                  # Flask application modules
+.gitlab-ci.yml        # GitLab CI/CD automation
+README.md             # Architecture and operating notes
 ```
 
-The CI/CD workflow validates AWS access, bootstraps encrypted/versioned S3 state, applies infrastructure, builds and pushes the backend image to ECR, updates Kubernetes resources, and waits for rollout completion.
+## Delivery workflow
 
-## Backend application
+1. GitLab CI validates AWS access and Terraform formatting.
+2. The pipeline creates or reuses the S3 remote-state bucket.
+3. Terraform initializes against the remote backend.
+4. Terraform applies AWS, Kubernetes, Helm, and observability resources.
+5. The backend image is built and pushed to Amazon ECR.
+6. The EKS Deployment is updated with the commit image tag.
+7. Kubernetes rollout status and the backend Ingress hostname are reported.
 
-The Flask service includes authentication, product and order APIs, admin APIs, CORS controls, rate limiting, security headers, MySQL connectivity, health endpoints, and Gunicorn-based serving.
+## Technology keywords
 
-## Security and cost notes
+`Terraform` · `HCL` · `Amazon EKS` · `Kubernetes` · `Helm` · `Amazon ECR` · `Amazon RDS` · `AWS IAM` · `OIDC` · `Secrets Manager` · `External Secrets Operator` · `AWS Load Balancer Controller` · `CloudWatch` · `Docker` · `Flask` · `GitLab CI/CD`
 
-This is a learning/portfolio project. Before production use, use short-lived AWS OIDC credentials, private subnets, least-privilege IAM policies, immutable image tags, a protected state bucket, environment-specific state, and approved change controls. Review reconciliation/cleanup logic before running it against shared AWS resources. EKS, EC2, RDS, load balancers, CloudWatch, and ECR can incur charges.
+## Configuration and safety
+
+Use environment-specific Terraform variables and protected GitLab CI/CD variables. Do not commit credentials, `.env` files, Terraform state, database passwords, or generated logs. Review every plan before applying it to a shared AWS account. EKS, RDS, load balancers, CloudWatch, and ECR can incur charges.
 
 ## Related repositories
 
-- [AWS 3-Tier Terraform Frontend](https://github.com/pavan-007-0/aws-3tier-terraform-frontend)
-- [AWS 3-Tier CFT Backend](https://github.com/pavan-007-0/aws-3tier-cft-backend)
-- [AWS 3-Tier CFT Frontend](https://github.com/pavan-007-0/aws-3tier-cft-frontend)
+- [Terraform frontend](https://github.com/pavan-007-0/aws-3tier-terraform-frontend)
+- [EKS YAML backend](https://github.com/pavan-007-0/aws-3tier-cft-backend)
+- [EKS YAML frontend](https://github.com/pavan-007-0/aws-3tier-cft-frontend)
+- ECS/CloudFormation repositories are documented separately under the `aws-3tier-cloudformation-ecs-*` naming convention.
